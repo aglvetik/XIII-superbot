@@ -1,0 +1,74 @@
+[package]
+name = "xiii-superbot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+resolver = "2"
+members = [
+  "crates/xiii-core",
+  "crates/xiii-config",
+  "crates/xiii-db",
+  "crates/xiii-discord",
+  "crates/xiii-scheduler",
+  "crates/xiii-permissions",
+  "crates/xiii-tickets",
+  "crates/xiii-voice-activity",
+  "crates/xiii-recruit",
+  "crates/xiii-vacation",
+  "crates/xiii-discipline",
+  "crates/xiii-clanlist",
+  "crates/xiii-tempvoice",
+]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive"] }
+dotenvy = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+jsonwebtoken = "9.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+thiserror = "1.0"
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+twilight-gateway = "0.16"
+twilight-http = "0.16"
+twilight-model = "0.16"
+urlencoding = "2.1"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+dotenvy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+twilight-gateway = { workspace = true }
+twilight-http = { workspace = true }
+twilight-model = { workspace = true }
+xiii-clanlist = { path = "crates/xiii-clanlist" }
+xiii-config = { path = "crates/xiii-config" }
+xiii-core = { path = "crates/xiii-core" }
+xiii-db = { path = "crates/xiii-db" }
+xiii-discipline = { path = "crates/xiii-discipline" }
+xiii-discord = { path = "crates/xiii-discord" }
+xiii-recruit = { path = "crates/xiii-recruit" }
+xiii-scheduler = { path = "crates/xiii-scheduler" }
+xiii-tempvoice = { path = "crates/xiii-tempvoice" }
+xiii-tickets = { path = "crates/xiii-tickets" }
+xiii-vacation = { path = "crates/xiii-vacation" }
+xiii-voice-activity = { path = "crates/xiii-voice-activity" }

@@ -1,0 +1,144 @@
+XIII Clanlist Render Parity Preview
+Mode: READ ONLY
+Discord HTTP reads: ENABLED ONLY WITH --allow-discord-read
+Discord Gateway: DISABLED
+Discord writes: DISABLED
+Message edits: DISABLED
+Role modifications: DISABLED
+Google Sheets: DISABLED
+Legacy JSON writes: DISABLED
+Migrations: DISABLED
+
+[OK] config unified env loaded and validated
+[OK] clanlist data dir exists: ../XIII_BOTS_FULL_COPY/opt/XIII/XIII-clanlist/data -> ../XIII_BOTS_FULL_COPY/opt/XIII/XIII-clanlist/data
+[OK] clanlist main roster message id = 1498766315299799185
+[OK] clanlist admin roster message id = 1498766321867821218
+[OK] clanlist steam roster message id = 1500086435506683954
+[OK] clanlist steam cache records = 19
+[OK] discord connected to Discord read-only
+[OK] discord roles fetched = 30
+[OK] discord members fetched = 55
+[WARN] clanlist main role has zero displayable members: role_id=1498022112131289216 role_name=Маршал
+[WARN] clanlist render preview cannot verify exact live Discord message layout because it does not fetch, send, or edit panel messages
+
+Discord read-only input:
+  guild_id: 1498022112114249819
+  roles_fetched: 30
+  members_fetched: 55
+
+Main roster preview:
+  target_channel_id: 1498762828666896535
+  target_message_id: 1498766315299799185
+  rendered_title: Список участников XIII
+  rendered_header_description: **Количество участников: 31**
+  marker_url: https://local.discord-roster-bot/panel/main
+  total_members: 31
+  omitted_role_ids:
+    - 1498022112131289216
+  role_sections:
+    - Основатель | role_id=1498022112131289217 | members=2
+      embed_title: Основатель (2)
+      1. <@896479333856710717> | display_name=[★] Kolya Satoru
+      2. <@331040337776869377> | display_name=[★] Потужный
+    - Офицерский состав | role_id=1498022112131289215 | members=3
+      embed_title: Офицерский состав (3)
+      1. <@417028049243209748> | display_name=[☆] MAESTRO
+      2. <@234265947592982529> | display_name=[☆] Velesklad
+      3. <@340884329733423116> | display_name=[☆] Бездарность ( Даниил )
+    - Сержант | role_id=1498022112131289209 | members=2
+      embed_title: Сержант (2)
+      1. <@833913063157530654> | display_name=[✦] blood tears (Олеженька)
+      2. <@1470904718309200096> | display_name=[✦] РЫБКА_С_ПИВОМ
+    - Рядовой | role_id=1498022112131289208 | members=22
+      embed_title: Рядовой (22)
+      1. <@893464384632930306> | display_name=[✧] _sebas__(Коля)
+      2. <@887374375345602630> | display_name=[✧] Alex_Bro
+      3. <@690199475007914012> | display_name=[✧] Beneficiary (Андрюшка)
+      4. <@633353351228162058> | display_name=[✧] Calvip(Виктор)
+      5. <@968542925736783892> | display_name=[✧] Casio (Слава)
+      6. <@709809542195838998> | display_name=[✧] Chuck Norris
+      7. <@1302276348093661185> | display_name=[✧] latviap
+      8. <@399484877038157825> | display_name=[✧] Lute (Евгеша)
+      9. <@289814973725671424> | display_name=[✧] MinWay
+      10. <@693086126725922817> | display_name=[✧] olivochka
+      11. <@338411198783422476> | display_name=[✧] Step19 (МИХАН)
+      12. <@1431010296096620575> | display_name=[✧] The Angelic of Devil(Серёга)
+      13. <@733044833953775659> | display_name=[✧] turboslav (Игорь)
+      14. <@403988593582014464> | display_name=[✧] VAGON (Иван)
+      15. <@654736250992853042> | display_name=[✧] vezy4iy
+      16. <@1341458199794024479> | display_name=[✧] Vov4ik
+      17. <@677817329953800203> | display_name=[✧] Гаджишка(Серго)
+      18. <@1358596679942803588> | display_name=[✧] Макс
+      19. <@712948486236012636> | display_name=[✧] Паша
+      20. <@1265691231921508374> | display_name=[✧] Прищепка
+      ... 2 more omitted
+    - Рекрут | role_id=1498022112114249828 | members=2
+      embed_title: Рекрут (2)
+      1. <@613950455654907906> | display_name=[✧✧] Ghostly.bro (Димон)
+      2. <@443086087779254272> | display_name=[✧✧] guma
+
+Admin roster preview:
+  target_channel_id: 1498763049102868672
+  target_message_id: 1498766321867821218
+  rendered_title: Административный состав XIII
+  rendered_header_description: **Количество участников: 7**
+  marker_url: https://local.discord-roster-bot/panel/admin
+  total_members: 7
+  role_sections:
+    - Основатель | role_id=1498022112131289217 | members=2
+      embed_title: Основатель (2)
+      1. <@896479333856710717> | display_name=[★] Kolya Satoru
+      2. <@331040337776869377> | display_name=[★] Потужный
+    - Оратор | role_id=1498057076151422976 | members=3
+      embed_title: Оратор (3)
+      1. <@234265947592982529> | display_name=[☆] Velesklad
+      2. <@833913063157530654> | display_name=[✦] blood tears (Олеженька)
+      3. <@1470904718309200096> | display_name=[✦] РЫБКА_С_ПИВОМ
+    - Составной | role_id=1498091840899911690 | members=1
+      embed_title: Составной (1)
+      1. <@417028049243209748> | display_name=[☆] MAESTRO
+    - Адъютант | role_id=1498091694456049994 | members=1
+      embed_title: Адъютант (1)
+      1. <@340884329733423116> | display_name=[☆] Бездарность ( Даниил )
+
+Steam roster preview:
+  target_channel_id: 1500081418506862754
+  target_message_id: 1500086435506683954
+  source: legacy steam cache
+  rendered_title: Список Steam ID XIII
+  rendered_header_description: **Действующие участники: 18**
+**Исключенные участники: 1**
+  active_count: 18
+  excluded_count: 1
+  unknown_member_count: 0
+  active_entries: 18
+    embed_title: Действующие участники (18)
+    1. <@417028049243209748>    Steam ID64: `76561198322325509` | status=active | display_name=[☆] MAESTRO
+    2. <@234265947592982529>    Steam ID64: `76561198039402032` | status=active | display_name=[☆] Velesklad
+    3. <@340884329733423116>    Steam ID64: `76561198379365351` | status=active | display_name=[☆] Бездарность ( Даниил )
+    4. <@833913063157530654>    Steam ID64: `76561199156480980` | status=active | display_name=[✦] blood tears (Олеженька)
+    5. <@1470904718309200096>    Steam ID64: `76561198759186094` | status=active | display_name=[✦] РЫБКА_С_ПИВОМ
+    6. <@893464384632930306>    Steam ID64: `76561199033730699` | status=active | display_name=[✧] _sebas__(Коля)
+    7. <@887374375345602630>    Steam ID64: `76561199011636327` | status=active | display_name=[✧] Alex_Bro
+    8. <@633353351228162058>    Steam ID64: `76561198951611492` | status=active | display_name=[✧] Calvip(Виктор)
+    9. <@968542925736783892>    Steam ID64: `76561199659063996` | status=active | display_name=[✧] Casio (Слава)
+    10. <@693086126725922817>    Steam ID64: `76561199073635302` | status=active | display_name=[✧] olivochka
+    11. <@338411198783422476>    Steam ID64: `76561198062770968` | status=active | display_name=[✧] Step19 (МИХАН)
+    12. <@1431010296096620575>    Steam ID64: `76561198759204910` | status=active | display_name=[✧] The Angelic of Devil(Серёга)
+    13. <@733044833953775659>    Steam ID64: `76561198435720764` | status=active | display_name=[✧] turboslav (Игорь)
+    14. <@403988593582014464>    Steam ID64: `76561198283595112` | status=active | display_name=[✧] VAGON (Иван)
+    15. <@654736250992853042>    Steam ID64: `76561199362953397` | status=active | display_name=[✧] vezy4iy
+    16. <@1341458199794024479>    Steam ID64: `76561199727970109` | status=active | display_name=[✧] Vov4ik
+    17. <@712948486236012636>    Steam ID64: `76561199201552921` | status=active | display_name=[✧] Паша
+    18. <@440607720047902722>    Steam ID64: `76561198078960627` | status=active | display_name=[✧] Роберт Полсон (Жека)
+  excluded_entries: 1
+    embed_title: Исключенные участники (1)
+    1. <@973660882242519150>    Steam ID64: `76561199861742815` | status=excluded | display_name=aglix.
+
+Limitations:
+  - Google Sheets is disabled; Steam preview uses legacy steam_roster_cache.json only.
+  - Legacy JSON/cache files are read-only; no Steam cache status/display-name updates are written.
+  - Discord message edits, sends, pins, placeholders, and allowed_mentions behavior are not executed.
+  - Footer timestamps are represented as the legacy format template rather than a live render timestamp.
+
+Summary: OK=9 WARN=2 FAIL=0

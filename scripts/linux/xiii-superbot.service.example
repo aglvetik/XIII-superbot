@@ -1,0 +1,18 @@
+[Unit]
+Description=XIII Superbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/XIII/xiii-superbot
+ExecStart=/opt/XIII/xiii-superbot/xiii-superbot run-superbot --env-file /opt/XIII/xiii-superbot/.env --allow-discord-read --allow-discord-write --confirm-run-superbot --modules clanlist --health-output /opt/XIII/xiii-superbot/data/superbot_health.json --require-old-services-stopped --old-services-dir /opt/XIII/xiii-superbot/data/service-status
+Restart=always
+RestartSec=15
+User=xiii
+Group=xiii
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

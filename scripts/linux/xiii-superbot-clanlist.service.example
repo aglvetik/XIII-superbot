@@ -1,0 +1,18 @@
+[Unit]
+Description=XIII Superbot Clanlist refresher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/XIII/xiii-superbot
+ExecStart=/opt/XIII/xiii-superbot/xiii-superbot run-clanlist --env-file /opt/XIII/xiii-superbot/.env --state-file /opt/XIII/xiii-superbot/data/clanlist_panel_state.json --allow-discord-read --allow-discord-write --confirm-run-clanlist --interval-seconds 600 --health-output /opt/XIII/xiii-superbot/data/clanlist_health.json
+Restart=always
+RestartSec=15
+User=xiii
+Group=xiii
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

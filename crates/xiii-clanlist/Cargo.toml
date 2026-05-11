@@ -1,0 +1,11 @@
+[package]
+name = "xiii-clanlist"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+xiii-config = { path = "../xiii-config" }
+xiii-core = { path = "../xiii-core" }

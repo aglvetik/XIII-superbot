@@ -1,0 +1,199 @@
+{
+  "mode": "dry-run Clanlist write plan from read-only render preview; no writes are executed",
+  "safety": {
+    "read_only": true,
+    "discord_login": false,
+    "discord_gateway": false,
+    "discord_http": true,
+    "google_sheets": false,
+    "legacy_json_writes": false,
+    "migrations": false
+  },
+  "render_summary": {
+    "guild_id": 1498022112114249819,
+    "role_count": 30,
+    "member_count": 55,
+    "main_total_members": 31,
+    "admin_total_members": 7,
+    "steam_active_records": 18,
+    "steam_excluded_records": 1,
+    "steam_unknown_member_records": 0
+  },
+  "planned_operations": [
+    {
+      "operation_type": "edit_existing_message",
+      "allowed": false,
+      "reason": "dry-run write plan only",
+      "panel_name": "main",
+      "channel_id": 1498762828666896535,
+      "message_id": 1498766315299799185,
+      "expected_title": "Список участников XIII",
+      "expected_embed_count": 6,
+      "expected_message_chunk_count": 1,
+      "expected_total_label": "expected_total_members",
+      "expected_total": 31,
+      "safety_checks": [
+        "allowed=false",
+        "Discord writes disabled",
+        "legacy JSON writes disabled",
+        "Google Sheets disabled",
+        "write_state_allowed=false"
+      ],
+      "rollback_notes": [
+        "No rollback is needed for this command because it performs no writes.",
+        "For a future writer cutover, rollback is to stop the superbot writer and restart the old xiii-clanlist.service."
+      ]
+    },
+    {
+      "operation_type": "edit_existing_message",
+      "allowed": false,
+      "reason": "dry-run write plan only",
+      "panel_name": "admin",
+      "channel_id": 1498763049102868672,
+      "message_id": 1498766321867821218,
+      "expected_title": "Административный состав XIII",
+      "expected_embed_count": 5,
+      "expected_message_chunk_count": 1,
+      "expected_total_label": "expected_total_members",
+      "expected_total": 7,
+      "safety_checks": [
+        "allowed=false",
+        "Discord writes disabled",
+        "legacy JSON writes disabled",
+        "Google Sheets disabled",
+        "write_state_allowed=false"
+      ],
+      "rollback_notes": [
+        "No rollback is needed for this command because it performs no writes.",
+        "For a future writer cutover, rollback is to stop the superbot writer and restart the old xiii-clanlist.service."
+      ]
+    },
+    {
+      "operation_type": "edit_existing_message",
+      "allowed": false,
+      "reason": "dry-run write plan only",
+      "panel_name": "steam",
+      "channel_id": 1500081418506862754,
+      "message_id": 1500086435506683954,
+      "expected_title": "Список Steam ID XIII",
+      "expected_embed_count": 3,
+      "expected_message_chunk_count": 1,
+      "expected_total_label": "expected_total_records",
+      "expected_total": 19,
+      "safety_checks": [
+        "allowed=false",
+        "Discord writes disabled",
+        "legacy JSON writes disabled",
+        "Google Sheets disabled",
+        "write_state_allowed=false"
+      ],
+      "rollback_notes": [
+        "No rollback is needed for this command because it performs no writes.",
+        "For a future writer cutover, rollback is to stop the superbot writer and restart the old xiii-clanlist.service."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "status": "OK",
+      "name": "render_preview_built",
+      "detail": "render preview model was built before write planning"
+    },
+    {
+      "status": "OK",
+      "name": "exactly_three_operations",
+      "detail": "planned operations = 3"
+    },
+    {
+      "status": "OK",
+      "name": "target_main_message_id_present",
+      "detail": "target main message id = 1498766315299799185"
+    },
+    {
+      "status": "OK",
+      "name": "target_main_channel_id_present",
+      "detail": "target main channel id = 1498762828666896535"
+    },
+    {
+      "status": "OK",
+      "name": "target_main_operation_disallowed",
+      "detail": "operation allowed=false in dry-run write plan only"
+    },
+    {
+      "status": "OK",
+      "name": "target_admin_message_id_present",
+      "detail": "target admin message id = 1498766321867821218"
+    },
+    {
+      "status": "OK",
+      "name": "target_admin_channel_id_present",
+      "detail": "target admin channel id = 1498763049102868672"
+    },
+    {
+      "status": "OK",
+      "name": "target_admin_operation_disallowed",
+      "detail": "operation allowed=false in dry-run write plan only"
+    },
+    {
+      "status": "OK",
+      "name": "target_steam_message_id_present",
+      "detail": "target steam message id = 1500086435506683954"
+    },
+    {
+      "status": "OK",
+      "name": "target_steam_channel_id_present",
+      "detail": "target steam channel id = 1500081418506862754"
+    },
+    {
+      "status": "OK",
+      "name": "target_steam_operation_disallowed",
+      "detail": "operation allowed=false in dry-run write plan only"
+    },
+    {
+      "status": "OK",
+      "name": "no_duplicate_target_message_ids",
+      "detail": "target message IDs are unique"
+    },
+    {
+      "status": "OK",
+      "name": "google_sheets_disabled",
+      "detail": "write plan uses legacy Steam cache only and does not call Google Sheets"
+    },
+    {
+      "status": "OK",
+      "name": "legacy_json_writes_disabled",
+      "detail": "legacy JSON files are read-only inputs and are not write targets"
+    },
+    {
+      "status": "OK",
+      "name": "discord_writes_disabled",
+      "detail": "planned Discord operations are allowed=false and are not executed"
+    },
+    {
+      "status": "OK",
+      "name": "write_state_allowed_false",
+      "detail": "module manifest remains write_state_allowed=false for this milestone"
+    },
+    {
+      "status": "OK",
+      "name": "no_filesystem_legacy_output_target",
+      "detail": "planned write targets are Discord channel/message IDs, not legacy filesystem paths"
+    }
+  ],
+  "warnings": [
+    "clanlist main role has zero displayable members: role_id=1498022112131289216 role_name=Маршал",
+    "clanlist render preview cannot verify exact live Discord message layout because it does not fetch, send, or edit panel messages",
+    "service_guard old xiii-clanlist.service stop state was not verified; production write execution must require it"
+  ],
+  "failures": [],
+  "rollback_notes": [
+    "Do not execute this plan until the old xiii-clanlist service is stopped and verified.",
+    "If a future write cutover fails, stop the superbot writer and restart the old xiii-clanlist.service.",
+    "If legacy JSON is ever changed in a later milestone, restore it from backup before returning control to the old service."
+  ],
+  "limitations": [
+    "This command does not fetch current Discord message contents; message existence/layout verification is a future read-only milestone.",
+    "This command never sends, edits, deletes, pins, or creates Discord messages.",
+    "This command never writes legacy JSON/cache files and never calls Google Sheets."
+  ]
+}

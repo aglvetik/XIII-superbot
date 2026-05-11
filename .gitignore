@@ -1,0 +1,66 @@
+# Rust build output
+/target/
+**/target/
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+*.env
+*.env.*
+
+# Local generated runtime state
+data/*
+!data/.gitkeep
+
+# Local health / preview / audit outputs
+*.log
+*.pid
+*.tmp
+*.bak
+*.backup
+*.old
+*.orig
+
+# SQLite / legacy bot databases
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Backups / archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+XIII_BOTS_FULL_COPY/
+XIII_BOTS_WINDOWS_COPY/
+XIII_BOTS_FULL_COPY.tar.gz
+XIII_BOTS_WINDOWS_COPY.tar.gz
+*.sha256
+
+# Local helper debris
+parity_fix.ps1
+parity_fix.mjs
+fix_*.ps1
+fix_*.mjs
+tmp_*.ps1
+tmp_*.mjs
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Windows / crash artifacts
+*.pdb
+*.ilk
+*.exe.stackdump

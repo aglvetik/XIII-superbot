@@ -1,0 +1,19 @@
+[package]
+name = "xiii-tickets"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+xiii-core = { path = "../xiii-core" }
+chrono = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+twilight-http = { workspace = true }
+twilight-model = { workspace = true }
+urlencoding = { workspace = true }
