@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -3555,7 +3555,7 @@ async fn handle_mixed_interaction(interaction: &Interaction, runtime: &MixedSupe
             } else if custom_id.starts_with("xiii:")
                 && runtime.selected.contains(&SuperbotModuleKind::Discipline)
             {
-                handle_discipline_component(interaction, custom_id, runtime).await;
+                handle_discipline_component(interaction, data.as_ref(), custom_id, runtime).await;
             } else if (custom_id.starts_with("public-stats-panel:")
                 || custom_id.starts_with("inactive-check:"))
                 && runtime
@@ -3680,6 +3680,66 @@ async fn respond_interaction_ephemeral_embeds_http(
     }
 }
 
+async fn respond_interaction_embeds_http(
+    client: &DiscordHttpClient,
+    interaction: &Interaction,
+    embeds: Vec<Embed>,
+    components: Option<Vec<Component>>,
+) {
+    let response = twilight_model::http::interaction::InteractionResponse {
+        kind: twilight_model::http::interaction::InteractionResponseType::ChannelMessageWithSource,
+        data: Some(twilight_model::http::interaction::InteractionResponseData {
+            allowed_mentions: Some(AllowedMentions::default()),
+            embeds: Some(embeds),
+            components,
+            ..Default::default()
+        }),
+    };
+    if let Err(err) = client
+        .interaction(Id::<ApplicationMarker>::new(
+            interaction.application_id.get(),
+        ))
+        .create_response(
+            Id::<twilight_model::id::marker::InteractionMarker>::new(interaction.id.get()),
+            interaction.token.as_str(),
+            &response,
+        )
+        .await
+    {
+        println!("[WARN] failed to respond to interaction with public embeds: {err}");
+    }
+}
+
+async fn respond_interaction_update_embeds_http(
+    client: &DiscordHttpClient,
+    interaction: &Interaction,
+    embeds: Vec<Embed>,
+    components: Option<Vec<Component>>,
+) {
+    let response = twilight_model::http::interaction::InteractionResponse {
+        kind: twilight_model::http::interaction::InteractionResponseType::UpdateMessage,
+        data: Some(twilight_model::http::interaction::InteractionResponseData {
+            allowed_mentions: Some(AllowedMentions::default()),
+            embeds: Some(embeds),
+            components,
+            ..Default::default()
+        }),
+    };
+    if let Err(err) = client
+        .interaction(Id::<ApplicationMarker>::new(
+            interaction.application_id.get(),
+        ))
+        .create_response(
+            Id::<twilight_model::id::marker::InteractionMarker>::new(interaction.id.get()),
+            interaction.token.as_str(),
+            &response,
+        )
+        .await
+    {
+        println!("[WARN] failed to update interaction message embeds: {err}");
+    }
+}
+
 async fn respond_interaction_modal_http(
     client: &DiscordHttpClient,
     interaction: &Interaction,
@@ -3761,6 +3821,49 @@ fn text_select(
                 })
                 .collect(),
         ),
+        placeholder: Some(placeholder.into()),
+    })
+}
+
+fn text_select_owned(
+    custom_id: impl Into<String>,
+    placeholder: impl Into<String>,
+    options: Vec<(String, String, Option<String>, bool)>,
+) -> Component {
+    Component::SelectMenu(SelectMenu {
+        channel_types: None,
+        custom_id: custom_id.into(),
+        default_values: None,
+        disabled: false,
+        kind: SelectMenuType::Text,
+        max_values: Some(1),
+        min_values: Some(1),
+        options: Some(
+            options
+                .into_iter()
+                .map(|(label, value, description, default)| SelectMenuOption {
+                    default,
+                    description,
+                    emoji: None,
+                    label,
+                    value,
+                })
+                .collect(),
+        ),
+        placeholder: Some(placeholder.into()),
+    })
+}
+
+fn user_select(custom_id: impl Into<String>, placeholder: impl Into<String>) -> Component {
+    Component::SelectMenu(SelectMenu {
+        channel_types: None,
+        custom_id: custom_id.into(),
+        default_values: None,
+        disabled: false,
+        kind: SelectMenuType::User,
+        max_values: Some(1),
+        min_values: Some(1),
+        options: None,
         placeholder: Some(placeholder.into()),
     })
 }
@@ -3928,6 +4031,21 @@ fn embed_with_fields_appearance(
         url: None,
         video: None,
     }
+}
+
+fn recruit_embed_from_draft(draft: xiii_recruit::render::RecruitEmbedDraft) -> Embed {
+    embed_with_fields_appearance(
+        &draft.title,
+        draft.description.as_deref(),
+        draft
+            .fields
+            .into_iter()
+            .map(|field| embed_field(field.name, field.value, field.inline))
+            .collect(),
+        draft.color,
+        draft.footer.as_deref(),
+        None,
+    )
 }
 
 fn parse_rfc3339_timestamp(value: &str) -> Option<Timestamp> {
@@ -4635,75 +4753,275 @@ async fn handle_discipline_command(
     }
 }
 
+#[derive(Debug, Clone)]
+struct DisciplinePickerMember {
+    user_id: u64,
+    display_name: String,
+    username: String,
+}
+
+#[derive(Debug, Clone)]
+struct DisciplineIssuePickerSession {
+    id: String,
+    issuer_id: u64,
+    page: usize,
+    members: Vec<DisciplinePickerMember>,
+    expires_at_unix_ms: u128,
+}
+
+const DISCIPLINE_ISSUE_PICKER_PAGE_SIZE: usize = 25;
+const DISCIPLINE_ISSUE_PICKER_TTL_MS: u128 = 10 * 60 * 1000;
+
+fn discipline_issue_picker_sessions(
+) -> &'static Mutex<HashMap<String, DisciplineIssuePickerSession>> {
+    static STORE: OnceLock<Mutex<HashMap<String, DisciplineIssuePickerSession>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn unix_millis_now() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default()
+}
+
+async fn discipline_issue_picker_members(
+    runtime: &MixedSuperbotRuntime,
+) -> Vec<DisciplinePickerMember> {
+    let cache = runtime.voice_activity_members.lock().await;
+    let mut members = cache
+        .values()
+        .filter(|member| {
+            !member.is_bot
+                && member
+                    .role_ids
+                    .contains(&runtime.config.discipline.main_clan_role_id)
+        })
+        .map(|member| DisciplinePickerMember {
+            user_id: member.user_id,
+            display_name: member.display_name.clone(),
+            username: member.username.clone().unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+            .then_with(|| left.user_id.cmp(&right.user_id))
+    });
+    members
+}
+
+async fn discipline_create_issue_picker_session(
+    runtime: &MixedSuperbotRuntime,
+    issuer_id: u64,
+) -> DisciplineIssuePickerSession {
+    let now = unix_millis_now();
+    let members = discipline_issue_picker_members(runtime).await;
+    let session = DisciplineIssuePickerSession {
+        id: format!(
+            "{:x}{:x}",
+            now,
+            (issuer_id ^ members.len() as u64).wrapping_mul(37)
+        ),
+        issuer_id,
+        page: 0,
+        members,
+        expires_at_unix_ms: now + DISCIPLINE_ISSUE_PICKER_TTL_MS,
+    };
+    let store = discipline_issue_picker_sessions();
+    let mut guard = store.lock().await;
+    guard.retain(|_, current| current.expires_at_unix_ms > now);
+    guard.insert(session.id.clone(), session.clone());
+    session
+}
+
+async fn discipline_get_issue_picker_session(
+    session_id: &str,
+) -> Option<DisciplineIssuePickerSession> {
+    let now = unix_millis_now();
+    let store = discipline_issue_picker_sessions();
+    let mut guard = store.lock().await;
+    guard.retain(|_, current| current.expires_at_unix_ms > now);
+    guard.get(session_id).cloned()
+}
+
+async fn discipline_update_issue_picker_session(
+    session: DisciplineIssuePickerSession,
+) -> DisciplineIssuePickerSession {
+    let mut updated = session;
+    updated.expires_at_unix_ms = unix_millis_now() + DISCIPLINE_ISSUE_PICKER_TTL_MS;
+    let store = discipline_issue_picker_sessions();
+    store
+        .lock()
+        .await
+        .insert(updated.id.clone(), updated.clone());
+    updated
+}
+
+async fn discipline_delete_issue_picker_session(session_id: &str) {
+    discipline_issue_picker_sessions()
+        .lock()
+        .await
+        .remove(session_id);
+}
+
+fn discipline_issue_picker_total_pages(session: &DisciplineIssuePickerSession) -> usize {
+    session
+        .members
+        .len()
+        .max(1)
+        .div_ceil(DISCIPLINE_ISSUE_PICKER_PAGE_SIZE)
+}
+
+fn discipline_truncate_option(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= 100 {
+        value.to_owned()
+    } else {
+        chars[..100].iter().collect::<String>()
+    }
+}
+
+fn discipline_issue_picker_message(
+    session: &DisciplineIssuePickerSession,
+) -> (String, Vec<Component>) {
+    let total_pages = discipline_issue_picker_total_pages(session);
+    let clamped_page = session.page.min(total_pages.saturating_sub(1));
+    let start = clamped_page * DISCIPLINE_ISSUE_PICKER_PAGE_SIZE;
+    let page_members = session
+        .members
+        .iter()
+        .skip(start)
+        .take(DISCIPLINE_ISSUE_PICKER_PAGE_SIZE)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let content = if page_members.is_empty() {
+        xiii_discipline::render::ISSUE_PICKER_EMPTY_CONTENT.to_owned()
+    } else {
+        xiii_discipline::render::ISSUE_PICKER_CONTENT.to_owned()
+    };
+
+    let mut components = Vec::new();
+    if !page_members.is_empty() {
+        components.push(action_row(vec![text_select_owned(
+            xiii_discipline::interactions::issue_member_select_id(&session.id),
+            xiii_discipline::render::issue_picker_placeholder(clamped_page, total_pages),
+            page_members
+                .into_iter()
+                .map(|member| {
+                    let normalized_display = if member.display_name.trim().is_empty() {
+                        "Участник XIII".to_owned()
+                    } else {
+                        member.display_name.trim().to_owned()
+                    };
+                    let username_different =
+                        !member.username.is_empty() && member.username != normalized_display;
+                    let label = if username_different {
+                        format!("{normalized_display} ({})", member.username)
+                    } else {
+                        normalized_display.clone()
+                    };
+                    (
+                        discipline_truncate_option(&label),
+                        member.user_id.to_string(),
+                        username_different
+                            .then(|| discipline_truncate_option(&format!("@{}", member.username))),
+                        false,
+                    )
+                })
+                .collect(),
+        )]));
+    }
+    components.push(action_row(vec![
+        button_with_disabled(
+            xiii_discipline::interactions::issue_picker_button_id(&session.id, "prev"),
+            xiii_discipline::render::PICKER_PREV_LABEL,
+            ButtonStyle::Secondary,
+            clamped_page == 0,
+        ),
+        button_with_disabled(
+            xiii_discipline::interactions::issue_picker_button_id(&session.id, "next"),
+            xiii_discipline::render::PICKER_NEXT_LABEL,
+            ButtonStyle::Secondary,
+            clamped_page + 1 >= total_pages,
+        ),
+        button(
+            xiii_discipline::interactions::issue_picker_button_id(&session.id, "id"),
+            xiii_discipline::render::PICKER_ID_LABEL,
+            ButtonStyle::Primary,
+        ),
+        button(
+            xiii_discipline::interactions::issue_picker_button_id(&session.id, "cancel"),
+            xiii_discipline::render::PICKER_CANCEL_LABEL,
+            ButtonStyle::Danger,
+        ),
+    ]));
+    (content, components)
+}
+
+fn discipline_issue_type_components(issuer_id: u64, target_user_id: u64) -> Vec<Component> {
+    vec![action_row(vec![text_select(
+        xiii_discipline::interactions::issue_type_select_id(issuer_id, target_user_id),
+        xiii_discipline::render::ISSUE_TYPE_PLACEHOLDER,
+        vec![
+            (xiii_discipline::render::WARNING_LABEL, "warning", false),
+            (xiii_discipline::render::VERBAL_LABEL, "verbal", false),
+            (xiii_discipline::render::STRICT_LABEL, "strict", false),
+        ],
+    )])]
+}
+
+fn discipline_parse_issue_picker_button(custom_id: &str) -> Option<(&str, &str)> {
+    let prefix = "xiii:issue:picker:";
+    let rest = custom_id.strip_prefix(prefix)?;
+    let (session_id, action) = rest.rsplit_once(':')?;
+    Some((session_id, action))
+}
+
 async fn handle_discipline_component(
     interaction: &Interaction,
+    data: &twilight_model::application::interaction::message_component::MessageComponentInteractionData,
     custom_id: &str,
     runtime: &MixedSuperbotRuntime,
 ) {
+    let actor_id = interaction
+        .author_id()
+        .map(|id| id.get())
+        .unwrap_or_default();
     match custom_id {
         xiii_discipline::interactions::PANEL_ISSUE => {
-            respond_interaction_modal_http(
+            let session = discipline_create_issue_picker_session(runtime, actor_id).await;
+            let (content, components) = discipline_issue_picker_message(&session);
+            respond_interaction_ephemeral_components_http(
                 runtime.http.as_ref(),
                 interaction,
-                "xiii:issue:modal",
-                xiii_discipline::render::ISSUE_ID_MODAL_TITLE,
-                vec![
-                    action_row(vec![text_input(
-                        "target_user_id",
-                        xiii_discipline::render::ISSUE_ID_MODAL_LABEL,
-                        TextInputStyle::Short,
-                        true,
-                    )]),
-                    action_row(vec![text_input(
-                        "type",
-                        "warning, verbal, strict",
-                        TextInputStyle::Short,
-                        true,
-                    )]),
-                    action_row(vec![text_input(
-                        "reason",
-                        xiii_discipline::render::ISSUE_REASON_LABEL,
-                        TextInputStyle::Paragraph,
-                        true,
-                    )]),
-                ],
+                &content,
+                components,
             )
             .await;
         }
         xiii_discipline::interactions::PANEL_REMOVE => {
-            respond_interaction_modal_http(
+            respond_interaction_ephemeral_components_http(
                 runtime.http.as_ref(),
                 interaction,
-                "xiii:remove:modal",
-                xiii_discipline::render::REMOVE_MODAL_TITLE,
-                vec![
-                    action_row(vec![text_input(
-                        "punishment_id",
-                        xiii_discipline::render::PUNISHMENT_ID_LABEL,
-                        TextInputStyle::Short,
-                        true,
-                    )]),
-                    action_row(vec![text_input(
-                        "reason",
-                        xiii_discipline::render::REMOVE_REASON_LABEL,
-                        TextInputStyle::Paragraph,
-                        true,
-                    )]),
-                ],
+                xiii_discipline::render::REMOVE_TARGET_PROMPT,
+                vec![action_row(vec![user_select(
+                    xiii_discipline::interactions::remove_user_select_id(actor_id),
+                    xiii_discipline::render::USER_SELECT_PLACEHOLDER,
+                )])],
             )
             .await;
         }
         xiii_discipline::interactions::PANEL_HISTORY => {
-            respond_interaction_modal_http(
+            respond_interaction_ephemeral_components_http(
                 runtime.http.as_ref(),
                 interaction,
-                "xiii:history:modal",
-                "История наказаний",
-                vec![action_row(vec![text_input(
-                    "target_user_id",
-                    xiii_discipline::render::ISSUE_ID_MODAL_LABEL,
-                    TextInputStyle::Short,
-                    true,
+                xiii_discipline::render::HISTORY_TARGET_PROMPT,
+                vec![action_row(vec![user_select(
+                    xiii_discipline::interactions::history_user_select_id(actor_id),
+                    xiii_discipline::render::USER_SELECT_PLACEHOLDER,
                 )])],
             )
             .await;
@@ -4721,104 +5039,432 @@ async fn handle_discipline_component(
             respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
         }
         _ if custom_id.starts_with("xiii:issue:member:") => {
-            if let Some(target_user_id) = custom_id
-                .strip_prefix("xiii:issue:member:")
+            let target_user_id = data
+                .values
+                .first()
                 .and_then(|value| value.parse::<u64>().ok())
-            {
-                respond_interaction_modal_http(
-                    runtime.http.as_ref(),
-                    interaction,
-                    &format!("xiii:issue:modal:{target_user_id}"),
-                    "Выдать наказание",
-                    vec![
-                        action_row(vec![text_input(
-                            "type",
-                            "warning, verbal, strict",
-                            TextInputStyle::Short,
-                            true,
-                        )]),
-                        action_row(vec![text_input(
-                            "reason",
-                            xiii_discipline::render::ISSUE_REASON_LABEL,
-                            TextInputStyle::Paragraph,
-                            true,
-                        )]),
-                    ],
-                )
-                .await;
-            } else {
+                .or_else(|| {
+                    custom_id
+                        .strip_prefix("xiii:issue:member:")
+                        .and_then(|value| value.parse::<u64>().ok())
+                });
+            let Some(target_user_id) = target_user_id else {
                 respond_interaction_ephemeral_http(
                     runtime.http.as_ref(),
                     interaction,
-                    "Invalid issue target.",
+                    xiii_discipline::render::INVALID_ISSUE_TARGET,
                 )
                 .await;
-            }
-        }
-        _ if custom_id.starts_with("xiii:remove:member:") => {
-            if let Some(target_user_id) = custom_id
-                .strip_prefix("xiii:remove:member:")
-                .and_then(|value| value.parse::<u64>().ok())
+                return;
+            };
+            match fetch_member_checked(runtime, runtime.config.core.guild_id, target_user_id).await
             {
-                match discipline_active_punishments_text(runtime, target_user_id).await {
-                    Ok(content) => {
-                        respond_interaction_ephemeral_components_http(
-                            runtime.http.as_ref(),
-                            interaction,
-                            &format!("{content}\n\nИспользуй кнопку ниже, чтобы ввести ID наказания для снятия."),
-                            vec![action_row(vec![button(
-                                format!("xiii:remove:open:{target_user_id}"),
-                                xiii_discipline::render::REMOVE_MODAL_TITLE,
-                                ButtonStyle::Danger,
-                            )])],
-                        )
-                        .await;
-                    }
-                    Err(err) => {
+                Ok(target) => {
+                    if let Err(err) = discipline_validate_target(
+                        runtime,
+                        runtime.config.core.guild_id,
+                        &target,
+                        interaction,
+                    ) {
                         respond_interaction_ephemeral_http(
                             runtime.http.as_ref(),
                             interaction,
                             &err,
                         )
                         .await;
+                        return;
                     }
+                    let content = xiii_discipline::render::issue_type_content(target_user_id);
+                    respond_interaction_ephemeral_components_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        &content,
+                        discipline_issue_type_components(actor_id, target_user_id),
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &err)
+                        .await;
                 }
             }
         }
-        _ if custom_id.starts_with("xiii:remove:open:") => {
-            if custom_id
-                .strip_prefix("xiii:remove:open:")
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some()
-            {
-                respond_interaction_modal_http(
-                    runtime.http.as_ref(),
-                    interaction,
-                    "xiii:remove:modal",
-                    xiii_discipline::render::REMOVE_MODAL_TITLE,
-                    vec![
-                        action_row(vec![text_input(
-                            "punishment_id",
-                            xiii_discipline::render::PUNISHMENT_ID_LABEL,
-                            TextInputStyle::Short,
-                            true,
-                        )]),
-                        action_row(vec![text_input(
-                            "reason",
-                            xiii_discipline::render::REMOVE_REASON_LABEL,
-                            TextInputStyle::Paragraph,
-                            true,
-                        )]),
-                    ],
-                )
-                .await;
-            } else {
+        _ if custom_id.starts_with("xiii:issue:picker:") => {
+            let Some((session_id, action)) = discipline_parse_issue_picker_button(custom_id) else {
                 respond_interaction_ephemeral_http(
                     runtime.http.as_ref(),
                     interaction,
-                    "Invalid remove target.",
+                    xiii_discipline::render::ISSUE_SESSION_EXPIRED,
                 )
                 .await;
+                return;
+            };
+            let Some(session) = discipline_get_issue_picker_session(session_id).await else {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::ISSUE_SESSION_EXPIRED,
+                )
+                .await;
+                return;
+            };
+            if session.issuer_id != actor_id {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::ISSUE_SESSION_EXPIRED,
+                )
+                .await;
+                return;
+            }
+            match action {
+                "cancel" => {
+                    discipline_delete_issue_picker_session(session_id).await;
+                    respond_interaction_ephemeral_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        xiii_discipline::render::ISSUE_CANCELLED,
+                    )
+                    .await;
+                }
+                "id" => {
+                    respond_interaction_modal_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        &xiii_discipline::interactions::issue_id_modal_id(session_id),
+                        xiii_discipline::render::ISSUE_ID_MODAL_TITLE,
+                        vec![action_row(vec![text_input(
+                            "target_user_id",
+                            xiii_discipline::render::ISSUE_ID_MODAL_LABEL,
+                            TextInputStyle::Short,
+                            true,
+                        )])],
+                    )
+                    .await;
+                }
+                "prev" | "next" => {
+                    let mut updated = session;
+                    let total_pages = discipline_issue_picker_total_pages(&updated);
+                    if action == "next" {
+                        updated.page = (updated.page + 1).min(total_pages.saturating_sub(1));
+                    } else {
+                        updated.page = updated.page.saturating_sub(1);
+                    }
+                    let updated = discipline_update_issue_picker_session(updated).await;
+                    let (content, components) = discipline_issue_picker_message(&updated);
+                    respond_interaction_ephemeral_components_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        &content,
+                        components,
+                    )
+                    .await;
+                }
+                _ => {
+                    respond_interaction_ephemeral_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        xiii_discipline::render::ISSUE_SESSION_EXPIRED,
+                    )
+                    .await;
+                }
+            }
+        }
+        _ if custom_id.starts_with("xiii:issue:type:") => {
+            let Some(rest) = custom_id.strip_prefix("xiii:issue:type:") else {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::ISSUE_SESSION_EXPIRED,
+                )
+                .await;
+                return;
+            };
+            let mut parts = rest.split(':');
+            let issuer_id = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let target_user_id = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let selected_type = data.values.first().cloned().unwrap_or_default();
+            let Ok(kind) = parse_punishment_type(&selected_type) else {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::INVALID_TYPE_TEXT,
+                )
+                .await;
+                return;
+            };
+            if issuer_id != Some(actor_id) || target_user_id.is_none() {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::ISSUE_SESSION_EXPIRED,
+                )
+                .await;
+                return;
+            }
+            let kind_token = match kind {
+                xiii_discipline::state::PunishmentType::Warning => "warning",
+                xiii_discipline::state::PunishmentType::Verbal => "verbal",
+                xiii_discipline::state::PunishmentType::Strict => "strict",
+            };
+            respond_interaction_modal_http(
+                runtime.http.as_ref(),
+                interaction,
+                &xiii_discipline::interactions::issue_modal_id(
+                    actor_id,
+                    target_user_id.unwrap_or_default(),
+                    kind_token,
+                ),
+                &format!("Выдать: {}", punishment_kind_name(kind)),
+                vec![action_row(vec![text_input(
+                    "reason",
+                    xiii_discipline::render::ISSUE_REASON_LABEL,
+                    TextInputStyle::Paragraph,
+                    true,
+                )])],
+            )
+            .await;
+        }
+        _ if custom_id.starts_with("xiii:remove:user:") => {
+            let issuer_id = custom_id
+                .strip_prefix("xiii:remove:user:")
+                .and_then(|value| value.parse::<u64>().ok());
+            let target_user_id = data
+                .values
+                .first()
+                .and_then(|value| value.parse::<u64>().ok());
+            if issuer_id != Some(actor_id) || target_user_id.is_none() {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::REMOVE_SESSION_EXPIRED,
+                )
+                .await;
+                return;
+            }
+            let Some(repo) = runtime.discipline_repo.as_ref() else {
+                return;
+            };
+            let target_user_id = target_user_id.unwrap_or_default();
+            match repo
+                .active_punishments(runtime.config.core.guild_id, target_user_id)
+                .await
+            {
+                Ok(active) if active.is_empty() => {
+                    respond_interaction_ephemeral_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        &xiii_discipline::render::remove_no_active_message(target_user_id),
+                    )
+                    .await;
+                }
+                Ok(active) => {
+                    let shown = active.len().min(25);
+                    let content = xiii_discipline::render::remove_selection_content(
+                        target_user_id,
+                        shown,
+                        active.len(),
+                    );
+                    let options = active
+                        .iter()
+                        .take(25)
+                        .map(|record| {
+                            let expires = record
+                                .expires_at
+                                .map(|unix| format!("<t:{unix}:d>"))
+                                .unwrap_or_else(|| "не истекает".to_owned());
+                            (
+                                discipline_truncate_option(&format!(
+                                    "#{} • {} • <t:{}:d>",
+                                    record.id,
+                                    punishment_kind_name(record.kind),
+                                    record.issued_at
+                                )),
+                                record.id.to_string(),
+                                Some(discipline_truncate_option(&format!(
+                                    "{} • {}",
+                                    expires, record.reason
+                                ))),
+                                false,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    respond_interaction_ephemeral_components_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        &content,
+                        vec![action_row(vec![text_select_owned(
+                            xiii_discipline::interactions::remove_punishment_select_id(
+                                actor_id,
+                                target_user_id,
+                            ),
+                            xiii_discipline::render::REMOVE_SELECT_PLACEHOLDER,
+                            options,
+                        )])],
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &err)
+                        .await;
+                }
+            }
+        }
+        _ if custom_id.starts_with("xiii:remove:punishment:") => {
+            let Some(rest) = custom_id.strip_prefix("xiii:remove:punishment:") else {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::REMOVE_SESSION_EXPIRED,
+                )
+                .await;
+                return;
+            };
+            let mut parts = rest.split(':');
+            let issuer_id = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let target_user_id = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let punishment_id = data
+                .values
+                .first()
+                .and_then(|value| value.parse::<i64>().ok());
+            if issuer_id != Some(actor_id) || target_user_id.is_none() || punishment_id.is_none() {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::REMOVE_SESSION_EXPIRED,
+                )
+                .await;
+                return;
+            }
+            respond_interaction_modal_http(
+                runtime.http.as_ref(),
+                interaction,
+                &xiii_discipline::interactions::remove_modal_id(
+                    actor_id,
+                    target_user_id.unwrap_or_default(),
+                    punishment_id.unwrap_or_default(),
+                ),
+                xiii_discipline::render::REMOVE_MODAL_TITLE,
+                vec![action_row(vec![text_input(
+                    "reason",
+                    xiii_discipline::render::REMOVE_REASON_LABEL,
+                    TextInputStyle::Paragraph,
+                    true,
+                )])],
+            )
+            .await;
+        }
+        _ if custom_id.starts_with("xiii:remove:member:") => {
+            let Some(target_user_id) = custom_id
+                .strip_prefix("xiii:remove:member:")
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::INVALID_REMOVE_TARGET,
+                )
+                .await;
+                return;
+            };
+            let Some(repo) = runtime.discipline_repo.as_ref() else {
+                return;
+            };
+            match repo
+                .active_punishments(runtime.config.core.guild_id, target_user_id)
+                .await
+            {
+                Ok(active) if active.is_empty() => {
+                    respond_interaction_ephemeral_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        &xiii_discipline::render::remove_no_active_message(target_user_id),
+                    )
+                    .await;
+                }
+                Ok(active) => {
+                    let shown = active.len().min(25);
+                    let content = xiii_discipline::render::remove_selection_content(
+                        target_user_id,
+                        shown,
+                        active.len(),
+                    );
+                    let options = active
+                        .iter()
+                        .take(25)
+                        .map(|record| {
+                            let expires = record
+                                .expires_at
+                                .map(|unix| format!("<t:{unix}:d>"))
+                                .unwrap_or_else(|| "не истекает".to_owned());
+                            (
+                                discipline_truncate_option(&format!(
+                                    "#{} • {} • <t:{}:d>",
+                                    record.id,
+                                    punishment_kind_name(record.kind),
+                                    record.issued_at
+                                )),
+                                record.id.to_string(),
+                                Some(discipline_truncate_option(&format!(
+                                    "{} • {}",
+                                    expires, record.reason
+                                ))),
+                                false,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    respond_interaction_ephemeral_components_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        &content,
+                        vec![action_row(vec![text_select_owned(
+                            xiii_discipline::interactions::remove_punishment_select_id(
+                                actor_id,
+                                target_user_id,
+                            ),
+                            xiii_discipline::render::REMOVE_SELECT_PLACEHOLDER,
+                            options,
+                        )])],
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &err)
+                        .await;
+                }
+            }
+        }
+        _ if custom_id.starts_with("xiii:history:user:") => {
+            let issuer_id = custom_id
+                .strip_prefix("xiii:history:user:")
+                .and_then(|value| value.parse::<u64>().ok());
+            let target_user_id = data
+                .values
+                .first()
+                .and_then(|value| value.parse::<u64>().ok());
+            if issuer_id != Some(actor_id) || target_user_id.is_none() {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::HISTORY_SESSION_EXPIRED,
+                )
+                .await;
+                return;
+            }
+            match discipline_history_embeds(runtime, target_user_id.unwrap_or_default()).await {
+                Ok(embeds) => {
+                    respond_interaction_ephemeral_embeds_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        embeds,
+                        None,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &err)
+                        .await;
+                }
             }
         }
         _ if custom_id.starts_with("xiii:history:member:") => {
@@ -4849,7 +5495,7 @@ async fn handle_discipline_component(
                 respond_interaction_ephemeral_http(
                     runtime.http.as_ref(),
                     interaction,
-                    "Invalid history target.",
+                    xiii_discipline::render::INVALID_HISTORY_TARGET,
                 )
                 .await;
             }
@@ -4858,7 +5504,7 @@ async fn handle_discipline_component(
             respond_interaction_ephemeral_http(
                 runtime.http.as_ref(),
                 interaction,
-                "Unsupported stale issue control. Use the board Issue button or /discipline member.",
+                "Элемент устарел. Открой выдачу наказания заново.",
             )
             .await;
         }
@@ -4866,7 +5512,7 @@ async fn handle_discipline_component(
             respond_interaction_ephemeral_http(
                 runtime.http.as_ref(),
                 interaction,
-                "Unsupported stale remove control. Use the board Remove button or /discipline member.",
+                "Элемент устарел. Открой снятие наказания заново.",
             )
             .await;
         }
@@ -4874,7 +5520,7 @@ async fn handle_discipline_component(
             respond_interaction_ephemeral_http(
                 runtime.http.as_ref(),
                 interaction,
-                "Unsupported stale history control. Use the board History button or /discipline member.",
+                "Элемент устарел. Открой историю заново.",
             )
             .await;
         }
@@ -4887,6 +5533,124 @@ async fn handle_discipline_modal(
     data: &twilight_model::application::interaction::modal::ModalInteractionData,
     runtime: &MixedSuperbotRuntime,
 ) {
+    let actor_id = interaction
+        .author_id()
+        .map(|id| id.get())
+        .unwrap_or_default();
+    if let Some(session_id) = data.custom_id.strip_prefix("xiii:issue:idmodal:") {
+        let Some(session) = discipline_get_issue_picker_session(session_id).await else {
+            respond_interaction_ephemeral_http(
+                runtime.http.as_ref(),
+                interaction,
+                xiii_discipline::render::ISSUE_SESSION_EXPIRED,
+            )
+            .await;
+            return;
+        };
+        if session.issuer_id != actor_id {
+            respond_interaction_ephemeral_http(
+                runtime.http.as_ref(),
+                interaction,
+                xiii_discipline::render::ISSUE_SESSION_EXPIRED,
+            )
+            .await;
+            return;
+        }
+        let Some(target_user_id) =
+            modal_value(data, "target_user_id").and_then(|value| value.parse::<u64>().ok())
+        else {
+            respond_interaction_ephemeral_http(
+                runtime.http.as_ref(),
+                interaction,
+                xiii_discipline::render::INVALID_MEMBER_ID,
+            )
+            .await;
+            return;
+        };
+        match fetch_member_checked(runtime, runtime.config.core.guild_id, target_user_id).await {
+            Ok(target) => {
+                if let Err(err) = discipline_validate_target(
+                    runtime,
+                    runtime.config.core.guild_id,
+                    &target,
+                    interaction,
+                ) {
+                    respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &err)
+                        .await;
+                    return;
+                }
+                let content = xiii_discipline::render::issue_type_content(target_user_id);
+                respond_interaction_ephemeral_components_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    &content,
+                    discipline_issue_type_components(session.issuer_id, target_user_id),
+                )
+                .await;
+            }
+            Err(err) => {
+                respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &err).await;
+            }
+        }
+        return;
+    }
+    if let Some(rest) = data.custom_id.strip_prefix("xiii:issue:modal:") {
+        let parts = rest.split(':').collect::<Vec<_>>();
+        if parts.len() == 3 {
+            let issuer_id = parts[0].parse::<u64>().ok();
+            let target_user_id = parts[1].parse::<u64>().ok();
+            let kind = parse_punishment_type(parts[2]).ok();
+            if issuer_id != Some(actor_id) || target_user_id.is_none() || kind.is_none() {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::ISSUE_SESSION_EXPIRED,
+                )
+                .await;
+                return;
+            }
+            let reason =
+                modal_value(data, "reason").unwrap_or_else(|| "Причина не указана".to_owned());
+            let response = discipline_issue(
+                runtime,
+                interaction,
+                target_user_id.unwrap_or_default(),
+                kind.unwrap_or(xiii_discipline::state::PunishmentType::Warning),
+                &reason,
+            )
+            .await
+            .unwrap_or_else(|err| err);
+            respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
+            return;
+        }
+    }
+    if let Some(rest) = data.custom_id.strip_prefix("xiii:remove:modal:") {
+        let parts = rest.split(':').collect::<Vec<_>>();
+        if parts.len() == 3 {
+            let issuer_id = parts[0].parse::<u64>().ok();
+            let punishment_id = parts[2].parse::<i64>().ok();
+            if issuer_id != Some(actor_id) || punishment_id.is_none() {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    xiii_discipline::render::REMOVE_SESSION_EXPIRED,
+                )
+                .await;
+                return;
+            }
+            let reason = modal_value(data, "reason").unwrap_or_else(|| "Ручное снятие".to_owned());
+            let response = discipline_remove(
+                runtime,
+                interaction,
+                punishment_id.unwrap_or_default(),
+                &reason,
+            )
+            .await
+            .unwrap_or_else(|err| err);
+            respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
+            return;
+        }
+    }
     let response = if data.custom_id == "xiii:issue:modal"
         || data.custom_id.starts_with("xiii:issue:modal:")
     {
@@ -4903,7 +5667,7 @@ async fn handle_discipline_modal(
                     respond_interaction_ephemeral_http(
                         runtime.http.as_ref(),
                         interaction,
-                        "Invalid target user ID.",
+                        xiii_discipline::render::INVALID_MEMBER_ID,
                     )
                     .await;
                     return;
@@ -4919,13 +5683,13 @@ async fn handle_discipline_modal(
                 respond_interaction_ephemeral_http(
                     runtime.http.as_ref(),
                     interaction,
-                    "Invalid punishment type. Use warning, verbal, or strict.",
+                    xiii_discipline::render::INVALID_TYPE_TEXT,
                 )
                 .await;
                 return;
             }
         };
-        let reason = modal_value(data, "reason").unwrap_or_else(|| "No reason provided".to_owned());
+        let reason = modal_value(data, "reason").unwrap_or_else(|| "Причина не указана".to_owned());
         discipline_issue(runtime, interaction, target_user_id, kind, &reason)
             .await
             .unwrap_or_else(|err| err)
@@ -4936,12 +5700,12 @@ async fn handle_discipline_modal(
             respond_interaction_ephemeral_http(
                 runtime.http.as_ref(),
                 interaction,
-                "Invalid punishment ID.",
+                xiii_discipline::render::INVALID_PUNISHMENT_ID,
             )
             .await;
             return;
         };
-        let reason = modal_value(data, "reason").unwrap_or_else(|| "Manual removal".to_owned());
+        let reason = modal_value(data, "reason").unwrap_or_else(|| "Ручное снятие".to_owned());
         discipline_remove(runtime, interaction, punishment_id, &reason)
             .await
             .unwrap_or_else(|err| err)
@@ -4950,10 +5714,10 @@ async fn handle_discipline_modal(
             Some(target_user_id) => discipline_history_text(runtime, target_user_id)
                 .await
                 .unwrap_or_else(|err| err),
-            None => "Invalid target user ID.".to_owned(),
+            None => xiii_discipline::render::INVALID_MEMBER_ID.to_owned(),
         }
     } else {
-        "Unsupported discipline modal.".to_owned()
+        "Неподдерживаемая форма дисциплины.".to_owned()
     };
     respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
 }
@@ -5190,33 +5954,6 @@ async fn discipline_history_text(
     Ok(format!(
         "Punishment history for <@{target_user_id}>:\n{lines}"
     ))
-}
-
-async fn discipline_active_punishments_text(
-    runtime: &MixedSuperbotRuntime,
-    target_user_id: u64,
-) -> Result<String, String> {
-    let Some(repo) = runtime.discipline_repo.as_ref() else {
-        return Err("Discipline repository is not available.".to_owned());
-    };
-    let rows = repo
-        .active_punishments(runtime.config.core.guild_id, target_user_id)
-        .await?;
-    if rows.is_empty() {
-        return Ok(format!("No active punishments for <@{target_user_id}>."));
-    }
-    Ok(rows
-        .iter()
-        .map(|record| {
-            format!(
-                "#{} {} reason={}",
-                record.id,
-                punishment_kind_name(record.kind),
-                record.reason
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n"))
 }
 
 async fn discipline_issue(
@@ -5764,10 +6501,46 @@ async fn handle_recruit_component(
                         chrono::Utc::now(),
                     )
                     .await;
+                let final_recruit = repo
+                    .get_recruit_by_id(recruit_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(recruit.clone());
+                let voice_seconds = repo
+                    .voice_seconds_for_recruit(&final_recruit, chrono::Utc::now())
+                    .await
+                    .unwrap_or_default();
+                let panel_embed =
+                    recruit_embed_from_draft(xiii_recruit::render::processed_decision_embed(
+                        &final_recruit,
+                        voice_seconds,
+                        xiii_recruit::render::accept_decision_label(),
+                        actor_id,
+                        xiii_recruit::render::LEGACY_ACCEPT_COLOR,
+                        None,
+                        None,
+                        &[],
+                    ));
+                if let Some((channel_id, message_id)) = interaction
+                    .message
+                    .as_ref()
+                    .map(|message| (interaction_channel_id(interaction), Some(message.id.get())))
+                    .and_then(|(channel_id, message_id)| channel_id.zip(message_id))
+                    .or_else(|| {
+                        recruit
+                            .last_decision_channel_id
+                            .zip(recruit.last_decision_message_id)
+                    })
+                {
+                    let _ = discord
+                        .edit_decision_panel(channel_id, message_id, &panel_embed)
+                        .await;
+                }
                 let _ = discord
-                    .dm_user(&xiii_recruit::discord_io::decision_dm(
+                    .dm_user(&xiii_recruit::discord_io::decision_dm_embed(
                         recruit.user_id,
-                        xiii_recruit::render::ACCEPT_DM_TITLE,
+                        recruit_embed_from_draft(xiii_recruit::render::accepted_dm_embed()),
                     ))
                     .await;
                 respond_interaction_ephemeral_http(
@@ -5880,10 +6653,48 @@ async fn handle_recruit_modal(
                         chrono::Utc::now(),
                     )
                     .await;
+                let final_recruit = repo
+                    .get_recruit_by_id(recruit_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(recruit.clone());
+                let voice_seconds = repo
+                    .voice_seconds_for_recruit(&final_recruit, chrono::Utc::now())
+                    .await
+                    .unwrap_or_default();
+                let panel_embed =
+                    recruit_embed_from_draft(xiii_recruit::render::processed_decision_embed(
+                        &final_recruit,
+                        voice_seconds,
+                        xiii_recruit::render::reject_decision_label(),
+                        actor_id,
+                        xiii_recruit::render::LEGACY_REJECT_COLOR,
+                        Some(&reason),
+                        None,
+                        &[],
+                    ));
+                if let Some((channel_id, message_id)) = recruit
+                    .last_decision_channel_id
+                    .zip(recruit.last_decision_message_id)
+                    .or_else(|| {
+                        interaction
+                            .message
+                            .as_ref()
+                            .map(|message| {
+                                (interaction_channel_id(interaction), Some(message.id.get()))
+                            })
+                            .and_then(|(channel_id, message_id)| channel_id.zip(message_id))
+                    })
+                {
+                    let _ = discord
+                        .edit_decision_panel(channel_id, message_id, &panel_embed)
+                        .await;
+                }
                 let _ = discord
-                    .dm_user(&xiii_recruit::discord_io::decision_dm(
+                    .dm_user(&xiii_recruit::discord_io::decision_dm_embed(
                         recruit.user_id,
-                        xiii_recruit::render::REJECT_DM_TITLE,
+                        recruit_embed_from_draft(xiii_recruit::render::rejected_dm_embed(&reason)),
                     ))
                     .await;
                 respond_interaction_ephemeral_http(
@@ -5914,6 +6725,11 @@ async fn handle_recruit_modal(
             .unwrap_or(runtime.config.recruit.default_days as i64);
         let reason = modal_value(data, "reason").unwrap_or_else(|| "Продлено".to_owned());
         let due_at = chrono::Utc::now() + chrono::Duration::days(days.max(1));
+        let prior_recruit = repo
+            .get_active_recruit_by_id(recruit_id)
+            .await
+            .ok()
+            .flatten();
         match repo
             .extend_with_decision(
                 recruit_id,
@@ -5926,6 +6742,53 @@ async fn handle_recruit_modal(
             .await
         {
             Ok(true) => {
+                if let Ok(Some(recruit)) = repo.get_active_recruit_by_id(recruit_id).await {
+                    let voice_seconds = repo
+                        .voice_seconds_for_recruit(&recruit, chrono::Utc::now())
+                        .await
+                        .unwrap_or_default();
+                    let panel_embed =
+                        recruit_embed_from_draft(xiii_recruit::render::processed_decision_embed(
+                            &recruit,
+                            voice_seconds,
+                            xiii_recruit::render::extend_decision_label(),
+                            actor_id,
+                            xiii_recruit::render::LEGACY_EXTEND_COLOR,
+                            Some(&reason),
+                            Some(days.max(1)),
+                            &[],
+                        ));
+                    if let Some((channel_id, message_id)) = prior_recruit
+                        .as_ref()
+                        .and_then(|value| {
+                            value
+                                .last_decision_channel_id
+                                .zip(value.last_decision_message_id)
+                        })
+                        .or_else(|| {
+                            interaction
+                                .message
+                                .as_ref()
+                                .map(|message| {
+                                    (interaction_channel_id(interaction), Some(message.id.get()))
+                                })
+                                .and_then(|(channel_id, message_id)| channel_id.zip(message_id))
+                        })
+                    {
+                        let _ = discord
+                            .edit_decision_panel(channel_id, message_id, &panel_embed)
+                            .await;
+                    }
+                    let _ = discord
+                        .dm_user(&xiii_recruit::discord_io::decision_dm_embed(
+                            recruit.user_id,
+                            recruit_embed_from_draft(xiii_recruit::render::extended_dm_embed(
+                                days.max(1),
+                                &reason,
+                            )),
+                        ))
+                        .await;
+                }
                 respond_interaction_ephemeral_http(
                     runtime.http.as_ref(),
                     interaction,
@@ -6048,18 +6911,14 @@ async fn send_recruit_decision_panel(
             ButtonStyle::Secondary,
         ),
     ])];
-    let embed = embed_with_appearance(
-        &xiii_recruit::render::decision_panel_title(&recruit.to_recruit()),
-        &format!(
-            "Стажёр: <@{}>\nDiscord ID: `{}`\nСтатус: Активная стажировка\n\nСрок до: <t:{}:f>",
-            recruit.user_id,
-            recruit.user_id,
-            recruit.to_recruit().due_unix
-        ),
-        xiii_recruit::render::LEGACY_DECISION_COLOR,
-        Some(&format!("ID стажировки: {recruit_id}")),
-        true,
-    );
+    let voice_seconds = repo
+        .voice_seconds_for_recruit(&recruit, chrono::Utc::now())
+        .await
+        .unwrap_or_default();
+    let embed = recruit_embed_from_draft(xiii_recruit::render::decision_panel_embed(
+        &recruit,
+        voice_seconds,
+    ));
     let message = discord
         .send_decision_panel(
             runtime.config.recruit.decision_channel_id,
@@ -6349,10 +7208,15 @@ async fn handle_voice_activity_inactive_command(
     period_key: &str,
     page: usize,
 ) {
-    match voice_activity_inactive_description(runtime, period_key, page).await {
-        Ok(description) => {
-            respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &description)
-                .await;
+    match voice_activity_inactive_view(runtime, period_key, page, false).await {
+        Ok((embed, components, _, _)) => {
+            respond_interaction_embeds_http(
+                runtime.http.as_ref(),
+                interaction,
+                vec![embed],
+                Some(components),
+            )
+            .await;
         }
         Err(err) => {
             respond_interaction_ephemeral_http(
@@ -6372,17 +7236,30 @@ async fn handle_voice_activity_component(
 ) {
     let custom_id = data.custom_id.as_str();
     if custom_id.starts_with("public-stats-panel:") {
+        let (current_period, current_page, _) =
+            voice_activity_public_panel_state(interaction.message.as_ref());
         let period = if custom_id == xiii_voice_activity::interactions::PUBLIC_STATS_PERIOD {
-            data.values.first().map(String::as_str).unwrap_or("7d")
+            data.values
+                .first()
+                .map(String::as_str)
+                .unwrap_or(current_period.as_str())
         } else {
-            "7d"
+            current_period.as_str()
         };
-        match voice_activity_public_panel_refresh_tick_for_period(runtime, period, 0).await {
-            Ok(()) => {
-                respond_interaction_ephemeral_http(
+        let page = if custom_id == xiii_voice_activity::interactions::PUBLIC_STATS_PREVIOUS {
+            current_page.saturating_sub(1)
+        } else if custom_id == xiii_voice_activity::interactions::PUBLIC_STATS_NEXT {
+            current_page.saturating_add(1)
+        } else {
+            0
+        };
+        match voice_activity_public_view(runtime, period, page).await {
+            Ok((embed, components, _, _)) => {
+                respond_interaction_update_embeds_http(
                     runtime.http.as_ref(),
                     interaction,
-                    "Voice stats panel refreshed from preserved DB state.",
+                    vec![embed],
+                    Some(components),
                 )
                 .await;
             }
@@ -6396,64 +7273,52 @@ async fn handle_voice_activity_component(
             }
         }
     } else if custom_id.starts_with("inactive-check:") {
+        let (current_period, current_page, auto_title) = voice_activity_inactive_panel_state(
+            interaction.message.as_ref(),
+            runtime.config.voice_activity.page_size as usize,
+        );
         let period = if custom_id == xiii_voice_activity::interactions::INACTIVE_PERIOD {
-            data.values.first().map(String::as_str).unwrap_or("7d")
+            data.values
+                .first()
+                .map(String::as_str)
+                .unwrap_or(current_period.as_str())
         } else {
-            "7d"
+            current_period.as_str()
         };
-        handle_voice_activity_inactive_command(interaction, runtime, period, 0).await;
+        let page = if custom_id == xiii_voice_activity::interactions::INACTIVE_PREVIOUS {
+            current_page.saturating_sub(1)
+        } else if custom_id == xiii_voice_activity::interactions::INACTIVE_NEXT {
+            current_page.saturating_add(1)
+        } else {
+            0
+        };
+        match voice_activity_inactive_view(runtime, period, page, auto_title).await {
+            Ok((embed, components, _, _)) => {
+                respond_interaction_update_embeds_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    vec![embed],
+                    Some(components),
+                )
+                .await;
+            }
+            Err(err) => {
+                respond_interaction_ephemeral_http(
+                    runtime.http.as_ref(),
+                    interaction,
+                    &format!("Voice inactive check failed: {err}"),
+                )
+                .await;
+            }
+        }
     }
 }
 
-async fn voice_activity_inactive_description(
+async fn voice_activity_public_view(
     runtime: &MixedSuperbotRuntime,
     period_key: &str,
     page: usize,
-) -> Result<String, String> {
-    let inputs = voice_activity_report_inputs(runtime, period_key).await?;
-    let members = runtime
-        .voice_activity_members
-        .lock()
-        .await
-        .values()
-        .map(|member| xiii_voice_activity::state::VoiceMemberForReport {
-            user_id: member.user_id,
-            display_name: member.display_name.clone(),
-            role_ids: member.role_ids.clone(),
-            is_bot: member.is_bot,
-        })
-        .collect::<Vec<_>>();
-    let entries = xiii_voice_activity::render::inactive_entries(
-        &members,
-        &inputs.completed,
-        &inputs.active,
-        runtime.config.voice_activity.inactive_role_id,
-        runtime.config.voice_activity.vacation_marker_role_id,
-        period_key,
-        page,
-        runtime.config.voice_activity.page_size as usize,
-        inputs.now,
-    );
-    Ok(xiii_voice_activity::render::render_inactive_description(
-        period_key, &entries,
-    ))
-}
-
-async fn voice_activity_public_panel_refresh_tick(
-    runtime: &MixedSuperbotRuntime,
-) -> Result<(), String> {
-    voice_activity_public_panel_refresh_tick_for_period(runtime, "7d", 0).await
-}
-
-async fn voice_activity_public_panel_refresh_tick_for_period(
-    runtime: &MixedSuperbotRuntime,
-    period_key: &str,
-    page: usize,
-) -> Result<(), String> {
-    if !runtime.config.voice_activity.public_stats_panel_enabled {
-        return Ok(());
-    }
-    let state = load_voice_activity_panel_state(runtime)?;
+) -> Result<(Embed, Vec<Component>, usize, usize), String> {
     let inputs = voice_activity_report_inputs(runtime, period_key).await?;
     let total_pages = xiii_voice_activity::render::leaderboard_total_pages(
         &inputs.completed,
@@ -6485,7 +7350,88 @@ async fn voice_activity_public_panel_refresh_tick_for_period(
         Some(xiii_voice_activity::render::LEGACY_FOOTER),
         true,
     );
-    let components = voice_activity_public_stats_components(period_key);
+    let components = voice_activity_public_stats_components(period_key, clamped_page, total_pages);
+    Ok((embed, components, clamped_page, total_pages))
+}
+
+async fn voice_activity_inactive_view(
+    runtime: &MixedSuperbotRuntime,
+    period_key: &str,
+    page: usize,
+    auto_title: bool,
+) -> Result<(Embed, Vec<Component>, usize, usize), String> {
+    let inputs = voice_activity_report_inputs(runtime, period_key).await?;
+    let members = runtime
+        .voice_activity_members
+        .lock()
+        .await
+        .values()
+        .map(|member| xiii_voice_activity::state::VoiceMemberForReport {
+            user_id: member.user_id,
+            display_name: member.display_name.clone(),
+            role_ids: member.role_ids.clone(),
+            is_bot: member.is_bot,
+        })
+        .collect::<Vec<_>>();
+    let total_pages = xiii_voice_activity::render::inactive_total_pages(
+        &members,
+        &inputs.completed,
+        &inputs.active,
+        runtime.config.voice_activity.inactive_role_id,
+        runtime.config.voice_activity.vacation_marker_role_id,
+        period_key,
+        runtime.config.voice_activity.page_size as usize,
+        inputs.now,
+    );
+    let clamped_page = page.min(total_pages.saturating_sub(1));
+    let entries = xiii_voice_activity::render::inactive_entries(
+        &members,
+        &inputs.completed,
+        &inputs.active,
+        runtime.config.voice_activity.inactive_role_id,
+        runtime.config.voice_activity.vacation_marker_role_id,
+        period_key,
+        clamped_page,
+        runtime.config.voice_activity.page_size as usize,
+        inputs.now,
+    );
+    let description =
+        xiii_voice_activity::render::render_inactive_description(period_key, &entries);
+    let title = if auto_title {
+        format!(
+            "XIII Inactivity Check · {}",
+            xiii_voice_activity::render::inactive_period_label(period_key)
+        )
+    } else {
+        "XIII Inactivity Check".to_owned()
+    };
+    let embed = embed_with_appearance(
+        &title,
+        &description,
+        xiii_voice_activity::render::LEGACY_EMBED_COLOR,
+        Some(xiii_voice_activity::render::LEGACY_FOOTER),
+        true,
+    );
+    let components = voice_activity_inactive_components(period_key, clamped_page, total_pages);
+    Ok((embed, components, clamped_page, total_pages))
+}
+
+async fn voice_activity_public_panel_refresh_tick(
+    runtime: &MixedSuperbotRuntime,
+) -> Result<(), String> {
+    voice_activity_public_panel_refresh_tick_for_period(runtime, "7d", 0).await
+}
+
+async fn voice_activity_public_panel_refresh_tick_for_period(
+    runtime: &MixedSuperbotRuntime,
+    period_key: &str,
+    page: usize,
+) -> Result<(), String> {
+    if !runtime.config.voice_activity.public_stats_panel_enabled {
+        return Ok(());
+    }
+    let state = load_voice_activity_panel_state(runtime)?;
+    let (embed, components, _, _) = voice_activity_public_view(runtime, period_key, page).await?;
     runtime
         .http
         .update_message(
@@ -6525,14 +7471,7 @@ async fn voice_activity_auto_report_tick(runtime: &MixedSuperbotRuntime) -> Resu
     {
         return Ok(());
     }
-    let description = voice_activity_inactive_description(runtime, "7d", 0).await?;
-    let embed = embed_with_appearance(
-        "XIII Inactivity Check",
-        &description,
-        xiii_voice_activity::render::LEGACY_EMBED_COLOR,
-        Some(xiii_voice_activity::render::LEGACY_FOOTER),
-        true,
-    );
+    let (embed, _, _, _) = voice_activity_inactive_view(runtime, "7d", 0, true).await?;
     runtime
         .http
         .create_message(Id::<ChannelMarker>::new(
@@ -6568,7 +7507,11 @@ fn load_voice_activity_panel_state(
     })
 }
 
-fn voice_activity_public_stats_components(period_key: &str) -> Vec<Component> {
+fn voice_activity_public_stats_components(
+    period_key: &str,
+    page: usize,
+    total_pages: usize,
+) -> Vec<Component> {
     vec![
         action_row(vec![text_select(
             xiii_voice_activity::interactions::PUBLIC_STATS_PERIOD,
@@ -6597,18 +7540,147 @@ fn voice_activity_public_stats_components(period_key: &str) -> Vec<Component> {
             ],
         )]),
         action_row(vec![
-            button(
+            button_with_disabled(
                 xiii_voice_activity::interactions::PUBLIC_STATS_PREVIOUS,
                 xiii_voice_activity::render::PREVIOUS_LABEL,
                 ButtonStyle::Secondary,
+                page == 0,
             ),
-            button(
+            button_with_disabled(
                 xiii_voice_activity::interactions::PUBLIC_STATS_NEXT,
                 xiii_voice_activity::render::NEXT_LABEL,
                 ButtonStyle::Secondary,
+                page + 1 >= total_pages.max(1),
             ),
         ]),
     ]
+}
+
+fn voice_activity_inactive_components(
+    period_key: &str,
+    page: usize,
+    total_pages: usize,
+) -> Vec<Component> {
+    vec![
+        action_row(vec![text_select(
+            xiii_voice_activity::interactions::INACTIVE_PERIOD,
+            xiii_voice_activity::render::PERIOD_SELECT_PLACEHOLDER,
+            vec![
+                (
+                    xiii_voice_activity::render::inactive_period_label("7d"),
+                    "7d",
+                    period_key == "7d",
+                ),
+                (
+                    xiii_voice_activity::render::inactive_period_label("14d"),
+                    "14d",
+                    period_key == "14d",
+                ),
+                (
+                    xiii_voice_activity::render::inactive_period_label("30d"),
+                    "30d",
+                    period_key == "30d",
+                ),
+                (
+                    xiii_voice_activity::render::inactive_period_label("60d"),
+                    "60d",
+                    period_key == "60d",
+                ),
+            ],
+        )]),
+        action_row(vec![
+            button_with_disabled(
+                xiii_voice_activity::interactions::INACTIVE_PREVIOUS,
+                xiii_voice_activity::render::PREVIOUS_LABEL,
+                ButtonStyle::Secondary,
+                page == 0,
+            ),
+            button_with_disabled(
+                xiii_voice_activity::interactions::INACTIVE_NEXT,
+                xiii_voice_activity::render::NEXT_LABEL,
+                ButtonStyle::Secondary,
+                page + 1 >= total_pages.max(1),
+            ),
+        ]),
+    ]
+}
+
+fn voice_activity_public_panel_state(message: Option<&DiscordMessage>) -> (String, usize, usize) {
+    let Some(description) = message
+        .and_then(|message| message.embeds.first())
+        .and_then(|embed| embed.description.as_deref())
+    else {
+        return ("7d".to_owned(), 0, 1);
+    };
+    let Some(first_line) = description.lines().next() else {
+        return ("7d".to_owned(), 0, 1);
+    };
+    let Some(rest) = first_line.strip_prefix("Период: ") else {
+        return ("7d".to_owned(), 0, 1);
+    };
+    let (label, page_part) = rest.split_once(" · Страница ").unwrap_or((rest, "1/1"));
+    let period_key = voice_activity_period_key_from_label(label.trim())
+        .unwrap_or("7d")
+        .to_owned();
+    let (page_raw, total_raw) = page_part.split_once('/').unwrap_or(("1", "1"));
+    let page = page_raw
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let total_pages = total_raw.trim().parse::<usize>().ok().unwrap_or(1).max(1);
+    (period_key, page, total_pages)
+}
+
+fn voice_activity_period_key_from_label(label: &str) -> Option<&'static str> {
+    ["7d", "14d", "30d", "all"]
+        .into_iter()
+        .find(|key| xiii_voice_activity::runtime::period_label(key) == label)
+}
+
+fn voice_activity_inactive_panel_state(
+    message: Option<&DiscordMessage>,
+    page_size: usize,
+) -> (String, usize, bool) {
+    let Some(embed) = message.and_then(|message| message.embeds.first()) else {
+        return ("7d".to_owned(), 0, false);
+    };
+    let description = embed.description.as_deref().unwrap_or_default();
+    let title = embed.title.as_deref().unwrap_or_default();
+    let mut period_key = "7d".to_owned();
+    let mut page = 0usize;
+    let mut saw_rank = false;
+    for line in description.lines() {
+        let trimmed = line.trim();
+        if let Some(label) = trimmed.strip_prefix("Период: ") {
+            period_key = match label.trim() {
+                "7 дней / 10ч" => "7d",
+                "14 дней / 20ч" => "14d",
+                "30 дней / 40ч" => "30d",
+                "60 дней / 80ч" => "60d",
+                _ => "7d",
+            }
+            .to_owned();
+            continue;
+        }
+        if saw_rank {
+            continue;
+        }
+        let Some((prefix, _)) = trimmed.split_once('.') else {
+            continue;
+        };
+        let Ok(rank) = prefix.parse::<usize>() else {
+            continue;
+        };
+        page = rank.saturating_sub(1) / page_size.max(1);
+        saw_rank = true;
+    }
+    (
+        period_key,
+        page,
+        title.starts_with("XIII Inactivity Check · "),
+    )
 }
 
 async fn run_temp_voice_runtime(
@@ -8342,7 +9414,7 @@ fn legacy_parity_modules_curated() -> Vec<LegacyParityModule> {
         },
         LegacyParityModule {
             module: "discipline",
-            status: LegacyParityStatus::Partial,
+            status: LegacyParityStatus::Exact,
             legacy_source: "../XIII_BOTS_FULL_COPY/opt/XIII/xiii-discipline-bot/src/services/boardService.ts ; ../XIII_BOTS_FULL_COPY/opt/XIII/xiii-discipline-bot/src/interactions/panel.ts ; ../XIII_BOTS_FULL_COPY/opt/XIII/xiii-discipline-bot/src/interactions/historyFlow.ts",
             findings: vec![
                 exact(
@@ -8357,17 +9429,17 @@ fn legacy_parity_modules_curated() -> Vec<LegacyParityModule> {
                     "crates/xiii-discipline/src/render.rs and src/app.rs::discipline_history_embeds",
                     "Issue/remove/history labels, modal copy, history empty state, oversize note, and navigation labels match legacy wording.",
                 ),
-                partial(
+                exact(
                     "interaction entry flow",
-                    "../XIII_BOTS_FULL_COPY/opt/XIII/xiii-discipline-bot/src/interactions/panel.ts and src/interactions/historyFlow.ts use picker-first member selection flows",
-                    "src/app.rs::handle_discipline_component still opens modal-first ID/mention entry for issue/remove/history",
-                    "Remaining mismatch: the visible entry flow still differs from legacy picker-first interactions even though the DB-backed board and history surfaces are ported.",
+                    "../XIII_BOTS_FULL_COPY/opt/XIII/xiii-discipline-bot/src/interactions/panel.ts and src/interactions/historyFlow.ts use picker-first and select-first member selection flows",
+                    "src/app.rs::handle_discipline_component and handle_discipline_modal now mirror picker/select-first flows for issue/remove/history",
+                    "Issue/remove/history now start with picker or select controls before modal submission, matching legacy visible interaction flow.",
                 ),
             ],
         },
         LegacyParityModule {
             module: "recruit",
-            status: LegacyParityStatus::Partial,
+            status: LegacyParityStatus::Exact,
             legacy_source: "../XIII_BOTS_FULL_COPY/opt/XIII/xiii-recruit-bot/app/services/embed_service.py ; ../XIII_BOTS_FULL_COPY/opt/XIII/xiii-recruit-bot/app/discord_ui/views.py ; ../XIII_BOTS_FULL_COPY/opt/XIII/xiii-recruit-bot/app/discord_ui/modals.py ; ../XIII_BOTS_FULL_COPY/opt/XIII/xiii-recruit-bot/app/services/decision_service.py",
             findings: vec![
                 exact(
@@ -8382,23 +9454,23 @@ fn legacy_parity_modules_curated() -> Vec<LegacyParityModule> {
                     "crates/xiii-recruit/src/render.rs modal constants and success copy",
                     "Modal titles/labels and success response constants are now ported.",
                 ),
-                partial(
+                exact(
                     "decision embed fields",
                     "../XIII_BOTS_FULL_COPY/opt/XIII/xiii-recruit-bot/app/services/embed_service.py::build_decision_embed",
-                    "crates/xiii-recruit/src/render.rs and src/app.rs recruit decision embed builder",
-                    "Remaining mismatch: legacy decision embeds include the full voice / probation length / extensions field set and richer footer details.",
+                    "crates/xiii-recruit/src/render.rs::decision_panel_embed / processed_decision_embed and src/app.rs recruit decision handlers",
+                    "Decision embeds now include the legacy summary description, deadlines, voice duration, extension count, decision block, optional extension days, reason, warnings, and recruit-id footer.",
                 ),
-                partial(
+                exact(
                     "DM body detail",
                     "../XIII_BOTS_FULL_COPY/opt/XIII/xiii-recruit-bot/app/services/embed_service.py accepted/rejected/extended DM embeds",
-                    "crates/xiii-recruit/src/discord_io.rs::decision_dm and current DM builders",
-                    "Remaining mismatch: full legacy DM embed bodies/fields are not yet ported.",
+                    "crates/xiii-recruit/src/render.rs::accepted_dm_embed / rejected_dm_embed / extended_dm_embed plus crates/xiii-recruit/src/discord_io.rs::decision_dm_embed",
+                    "Accepted/rejected/extended DM embeds now carry the legacy title/body/field/footer copy rather than simplified placeholder text.",
                 ),
             ],
         },
         LegacyParityModule {
             module: "voice_activity",
-            status: LegacyParityStatus::Partial,
+            status: LegacyParityStatus::Exact,
             legacy_source: "../XIII_BOTS_FULL_COPY/opt/XIII/xiii-voice-activity-bot/app/views/public_stats_view.py ; ../XIII_BOTS_FULL_COPY/opt/XIII/xiii-voice-activity-bot/app/views/inactive_view.py ; ../XIII_BOTS_FULL_COPY/opt/XIII/xiii-voice-activity-bot/app/cogs/public_stats.py",
             findings: vec![
                 exact(
@@ -8413,17 +9485,17 @@ fn legacy_parity_modules_curated() -> Vec<LegacyParityModule> {
                     "crates/xiii-voice-activity/src/render.rs::voice_top_disabled_response",
                     "Disabled /voice-top response now matches legacy wording.",
                 ),
-                partial(
-                    "navigation and auto-report behavior",
-                    "../XIII_BOTS_FULL_COPY/opt/XIII/xiii-voice-activity-bot/app/views/public_stats_view.py / inactive_view.py disable previous/next at edges and auto reports label the title with the selected period",
-                    "src/app.rs::voice_activity_public_stats_components and voice_activity_auto_report_tick",
-                    "Remaining mismatch: previous/next buttons are still always enabled in the public panel, and automatic inactivity reports still use a fixed title instead of the legacy period-labelled title.",
+                exact(
+                    "interactive views",
+                    "../XIII_BOTS_FULL_COPY/opt/XIII/xiii-voice-activity-bot/app/views/public_stats_view.py / inactive_view.py and app/cogs/inactivity.py",
+                    "src/app.rs::handle_voice_activity_component / handle_voice_activity_inactive_command plus public/inactive component builders",
+                    "Public stats and inactive-check now answer with legacy-style embed/view updates, disable previous/next at boundaries, preserve period/page state, and use the period-labelled inactivity title for automatic reports.",
                 ),
             ],
         },
         LegacyParityModule {
             module: "tickets",
-            status: LegacyParityStatus::Partial,
+            status: LegacyParityStatus::AcceptedDifference,
             legacy_source: "../XIII_BOTS_FULL_COPY/opt/xiii-ticketbot/app/services/ticket_service.py ; ../XIII_BOTS_FULL_COPY/opt/xiii-ticketbot/app/discord_app/views/close.py ; ../XIII_BOTS_FULL_COPY/opt/xiii-ticketbot/app/services/transcript_service.py",
             findings: vec![
                 exact(
@@ -8438,17 +9510,23 @@ fn legacy_parity_modules_curated() -> Vec<LegacyParityModule> {
                     "crates/xiii-tickets/src/render.rs::transcript_html",
                     "Accepted difference: the Superbot keeps a safe Rust HTML transcript substitute instead of the Python chat_exporter markup, while preserving author/timestamp/content/attachment reviewability without pings.",
                 ),
-                partial(
+                exact(
                     "ticket opening messages",
                     "../XIII_BOTS_FULL_COPY/opt/xiii-ticketbot/app/services/ticket_service.py application_form_message / promotion_request_message / complaint embed",
                     "src/app.rs ticket creation path plus crates/xiii-tickets/src/discord_io.rs::ticket_open_payload",
-                    "Remaining mismatch: legacy per-ticket-type opening message bodies still differ from the unified Superbot payload.",
+                    "Application, complaint, promotion, and custom ticket opening copy now follows the legacy per-ticket-type bodies instead of a unified placeholder payload.",
                 ),
-                partial(
-                    "close DM/summary embeds",
-                    "../XIII_BOTS_FULL_COPY/opt/xiii-ticketbot/app/discord_app/views/close.py and app/services/transcript_service.py",
-                    "crates/xiii-tickets/src/runtime.rs close/reopen DM text and src/app.rs lifecycle handlers",
-                    "Remaining mismatch: close confirmation, DM wording, and transcript summary copy are still simplified compared with legacy.",
+                exact(
+                    "officer review copy",
+                    "../XIII_BOTS_FULL_COPY/opt/xiii-ticketbot officer review application flow",
+                    "crates/xiii-tickets/src/render.rs::officer_review_description and src/app.rs Google review sender",
+                    "Officer review wording now follows the legacy application review checklist and result text.",
+                ),
+                exact(
+                    "close summary / reopen lifecycle surface",
+                    "../XIII_BOTS_FULL_COPY/opt/xiii-ticketbot/app/discord_app/views/close.py ; app/discord_app/views/after_close.py ; app/services/transcript_service.py",
+                    "crates/xiii-tickets/src/render.rs ; crates/xiii-tickets/src/discord_io.rs ; src/app.rs::handle_ticket_component / ticket_close_current_channel / ticket_reopen_current_channel",
+                    "The Superbot now uses the legacy public close confirmation embed, close-result summary embed with after-close reopen/delete view, transcript summary embed delivery, and DM reopen surface.",
                 ),
             ],
         },
@@ -8479,21 +9557,6 @@ fn close(
     LegacyParityFinding {
         category,
         status: LegacyParityStatus::AcceptedDifference,
-        legacy,
-        superbot,
-        note,
-    }
-}
-
-fn partial(
-    category: &'static str,
-    legacy: &'static str,
-    superbot: &'static str,
-    note: &'static str,
-) -> LegacyParityFinding {
-    LegacyParityFinding {
-        category,
-        status: LegacyParityStatus::Partial,
         legacy,
         superbot,
         note,
@@ -8536,7 +9599,8 @@ fn module_render_preview_curated(module: SuperbotModuleKind) -> RenderPreviewMod
                 embed_preview_with_details(
                     "steam roster",
                     "Список Steam ID XIII",
-                    "**Действующие:** N\n**Исключённые:** N",
+                    "**Количество Discord участников:** N\n**Количество Steam ID:** N",
+
                     vec!["Steam legacy cache only; no Google reads in preview"],
                     "#0066FF",
                     "Обновлено: {timestamp}",
@@ -8577,7 +9641,10 @@ fn module_render_preview_curated(module: SuperbotModuleKind) -> RenderPreviewMod
                 embed_preview_with_details(
                     "active vacations",
                     xiii_vacation::render::ACTIVE_PANEL_TITLE,
-                    "Сейчас в отпуске: N\n\n**1.** <@42> • <t:1715335200:d> → <t:1715594400:d> • <t:1715594400:R>\n> Причина: family trip",
+                    "Сейчас в отпуске: N\n\n**1.** <@42> • <t:1715335200:d> • <t:1715594400:d> • <t:1715594400:R>\n> Причина: family trip",
+
+
+
                     vec!["truncation line: Показаны первые N отпусков из M."],
                     "#5865F2",
                     xiii_vacation::render::LEGACY_FOOTER,
@@ -8710,7 +9777,10 @@ fn module_render_preview_curated(module: SuperbotModuleKind) -> RenderPreviewMod
                 embed_preview_with_details(
                     "history",
                     xiii_discipline::render::HISTORY_TITLE,
-                    "<@42> • Страница 1/2\n\n1. Предупреждение — Активно\nПричина: AFK",
+                    "<@42> • Страница 1/2\n\n1. Предупреждение • активно\nПричина: AFK",
+
+
+
                     vec![
                         xiii_discipline::render::EMPTY_HISTORY_TEMPLATE,
                         xiii_discipline::render::HISTORY_OVERSIZE_NOTE,
@@ -8755,37 +9825,37 @@ fn module_render_preview_curated(module: SuperbotModuleKind) -> RenderPreviewMod
             modals: vec![
                 modal_preview(
                     "issue id",
-                    "xiii:issue:modal",
+                    "xiii:issue:idmodal:{session}",
                     xiii_discipline::render::ISSUE_ID_MODAL_TITLE,
-                    vec![
-                        xiii_discipline::render::ISSUE_ID_MODAL_LABEL,
-                        "warning, verbal, strict",
-                        xiii_discipline::render::ISSUE_REASON_LABEL,
-                    ],
+                    vec![xiii_discipline::render::ISSUE_ID_MODAL_LABEL],
+
+
+
+
                     vec![],
                 ),
                 modal_preview(
                     "remove",
-                    "xiii:remove:modal",
+                    "xiii:remove:modal:{issuer}:{target}:{punishment_id}",
                     xiii_discipline::render::REMOVE_MODAL_TITLE,
-                    vec![
-                        xiii_discipline::render::PUNISHMENT_ID_LABEL,
-                        xiii_discipline::render::REMOVE_REASON_LABEL,
-                    ],
+                    vec![xiii_discipline::render::REMOVE_REASON_LABEL],
+
+
+
                     vec![],
                 ),
                 modal_preview(
-                    "history",
-                    "xiii:history:modal",
-                    "История наказаний",
-                    vec![xiii_discipline::render::ISSUE_ID_MODAL_LABEL],
+                    "issue reason",
+                    "xiii:issue:modal:{issuer}:{target}:{type}",
+                    "\u{0412}\u{044b}\u{0434}\u{0430}\u{0442}\u{044c}: \u{041f}\u{0440}\u{0435}\u{0434}\u{0443}\u{043f}\u{0440}\u{0435}\u{0436}\u{0434}\u{0435}\u{043d}\u{0438}\u{0435}",
+                    vec![xiii_discipline::render::ISSUE_REASON_LABEL],
                     vec![],
                 ),
             ],
             commands: vec!["/discipline setup", "/discipline member", "/discipline health"],
             text_responses: vec!["ephemeral moderation responses; admin log embeds; DM notifications"],
             allowed_mentions: vec!["disabled"],
-            warnings: vec!["PARTIAL: legacy panel.ts/historyFlow.ts use picker-first member selection, while current Superbot board actions still start from modal-first ID/mention entry."],
+            warnings: vec![],
         },
         SuperbotModuleKind::Recruit => RenderPreviewModule {
             module: module.name(),
@@ -8794,7 +9864,11 @@ fn module_render_preview_curated(module: SuperbotModuleKind) -> RenderPreviewMod
                 "decision panel",
                 xiii_recruit::render::DECISION_PANEL_TITLE,
                 xiii_recruit::render::DECISION_PREVIEW_DESCRIPTION,
-                vec!["legacy embed also includes voice time, probation length, extension count, and richer status fields"],
+                vec![
+                    "description: стажёр mention, Discord ID, статус",
+                    "fields: сроки / голос / продлений",
+                    "processed decision adds решение, optional продление, причина, предупреждения",
+                ],
                 "#F1C40F",
                 xiii_recruit::render::DECISION_FOOTER_PREVIEW,
                 "footer uses recruit id",
@@ -8848,7 +9922,7 @@ fn module_render_preview_curated(module: SuperbotModuleKind) -> RenderPreviewMod
                 "disabled by default",
                 "automatic due panel limited to RECRUIT_DECISION_PING_ROLE_IDS",
             ],
-            warnings: vec!["PARTIAL: detailed decision fields and DM embed bodies still differ from the legacy bot."],
+            warnings: vec![],
         },
         SuperbotModuleKind::VoiceActivity => RenderPreviewModule {
             module: module.name(),
@@ -8858,7 +9932,7 @@ fn module_render_preview_curated(module: SuperbotModuleKind) -> RenderPreviewMod
                     "public stats",
                     "XIII Voice Activity",
                     xiii_voice_activity::render::PUBLIC_STATS_PREVIEW_DESCRIPTION,
-                    vec!["leaderboard rows: 🥇/🥈/🥉 medals, escaped display name, compact duration, Russian points suffix"],
+                    vec!["leaderboard rows: top-three medals, escaped display name, compact duration, Russian points suffix"],
                     "#5865F2",
                     xiii_voice_activity::render::LEGACY_FOOTER,
                     "current UTC timestamp",
@@ -8903,31 +9977,101 @@ fn module_render_preview_curated(module: SuperbotModuleKind) -> RenderPreviewMod
             commands: vec!["/voice-top", "/inactive-check"],
             text_responses: vec!["/voice-top returns the legacy disabled message pointing to the public stats panel"],
             allowed_mentions: vec!["disabled"],
-            warnings: vec!["PARTIAL: previous/next buttons are still always enabled in the live public panel, and automatic inactivity reports still use a fixed title instead of the legacy period-labelled title."],
+            warnings: vec![],
         },
         SuperbotModuleKind::Tickets => RenderPreviewModule {
             module: module.name(),
             parity_status: parity,
-            embeds: vec![embed_preview_with_details(
-                "ticket panel",
-                xiii_tickets::render::panel_title(),
-                xiii_tickets::render::panel_description(),
-                vec!["application / complaint / promotion buttons in legacy order"],
-                "#3498DB",
-                "none",
-                "no timestamp",
-            )],
-            buttons: xiii_tickets::discord_io::ticket_panel_button_specs()
-                .iter()
-                .map(|button| {
+            embeds: vec![
+                embed_preview_with_details(
+                    "ticket panel",
+                    xiii_tickets::render::panel_title(),
+                    xiii_tickets::render::panel_description(),
+                    vec!["application / complaint / promotion buttons in legacy order"],
+                    "#3498DB",
+                    "none",
+                    "no timestamp",
+                ),
+                embed_preview_with_details(
+                    "ticket close confirmation",
+                    xiii_tickets::render::CLOSE_CONFIRM_TITLE,
+                    xiii_tickets::render::CLOSE_CONFIRM_DESCRIPTION,
+                    vec![],
+                    "#E74C3C",
+                    "none",
+                    "no timestamp",
+                ),
+                embed_preview_with_details(
+                    "ticket transcript summary",
+                    xiii_tickets::render::TRANSCRIPT_SUMMARY_TITLE,
+                    "",
+                    vec![
+                        xiii_tickets::render::TRANSCRIPT_FIELD_TICKET,
+                        xiii_tickets::render::TRANSCRIPT_FIELD_NUMBER,
+                        xiii_tickets::render::TRANSCRIPT_FIELD_TYPE,
+                        xiii_tickets::render::TRANSCRIPT_FIELD_OPENED_BY,
+                        xiii_tickets::render::TRANSCRIPT_FIELD_CLOSED_BY,
+                        xiii_tickets::render::TRANSCRIPT_FIELD_PARTICIPANTS,
+                        xiii_tickets::render::TRANSCRIPT_FIELD_OPENED_AT,
+                        xiii_tickets::render::TRANSCRIPT_FIELD_CLOSED_AT,
+                    ],
+                    "#607D8B",
+                    "none",
+                    "no timestamp",
+                ),
+            ],
+            buttons: {
+                let mut buttons = xiii_tickets::discord_io::ticket_panel_button_specs()
+                    .iter()
+                    .map(|button| {
+                        button_preview(
+                            "ticket panel",
+                            button.custom_id,
+                            button.label,
+                            button_style_name(button.style),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                buttons.extend([
                     button_preview(
-                        "ticket panel",
-                        button.custom_id,
-                        button.label,
-                        button_style_name(button.style),
-                    )
-                })
-                .collect(),
+                        "ticket lifecycle",
+                        xiii_tickets::interactions::TICKET_CLOSE,
+                        xiii_tickets::render::TICKET_CLOSE_LABEL,
+                        "Danger",
+                    ),
+                    button_preview(
+                        "ticket close confirmation",
+                        xiii_tickets::interactions::TICKET_CLOSE_CONFIRM,
+                        xiii_tickets::render::TICKET_CLOSE_CONFIRM_LABEL,
+                        "Danger",
+                    ),
+                    button_preview(
+                        "ticket close confirmation",
+                        xiii_tickets::interactions::TICKET_CLOSE_CANCEL,
+                        xiii_tickets::render::TICKET_CLOSE_CANCEL_LABEL,
+                        "Secondary",
+                    ),
+                    button_preview(
+                        "ticket after-close view",
+                        xiii_tickets::interactions::TICKET_DELETE,
+                        xiii_tickets::render::TICKET_DELETE_LABEL,
+                        "Danger",
+                    ),
+                    button_preview(
+                        "ticket after-close view",
+                        xiii_tickets::interactions::TICKET_REOPEN_MOD,
+                        xiii_tickets::render::TICKET_REOPEN_LABEL,
+                        "Success",
+                    ),
+                    button_preview(
+                        "ticket DM reopen",
+                        xiii_tickets::interactions::DM_REOPEN_GENERIC,
+                        xiii_tickets::render::TICKET_REOPEN_LABEL,
+                        "Success",
+                    ),
+                ]);
+                buttons
+            },
             modals: Vec::new(),
             commands: vec![
                 "/add member",
@@ -8938,14 +10082,11 @@ fn module_render_preview_curated(module: SuperbotModuleKind) -> RenderPreviewMod
                 "!reject|!отклонить",
             ],
             text_responses: vec![
-                "public: ticket channel lifecycle messages and officer review embeds",
-                "dm: reopen and ticket status updates",
+                "public: ticket channel lifecycle messages, close-summary embeds, and officer review embeds",
+                "dm: transcript summary embed, reopen button, and ticket status updates",
             ],
             allowed_mentions: vec!["disabled by default", "configured ticket ping roles only"],
-            warnings: vec![
-                "ACCEPTED_DIFFERENCE: transcript is safe Rust HTML, not exact chat_exporter markup.",
-                "PARTIAL: ticket opening/close copy still differs; see legacy-parity-audit.",
-            ],
+            warnings: vec!["ACCEPTED_DIFFERENCE: transcript is safe Rust HTML, not exact chat_exporter markup."],
         },
     }
 }
@@ -9226,37 +10367,41 @@ async fn handle_ticket_component(
             .await;
         }
         TicketComponentRoute::Close => {
-            respond_interaction_ephemeral_components_http(
+            respond_interaction_embeds_http(
                 runtime.http.as_ref(),
                 interaction,
-                "Confirm closing this ticket. A transcript will be sent to the transcript channel.",
-                vec![action_row(vec![
-                    button(
-                        xiii_tickets::interactions::TICKET_CLOSE_CONFIRM,
-                        "Confirm close",
-                        ButtonStyle::Danger,
-                    ),
-                    button(
-                        xiii_tickets::interactions::TICKET_CLOSE_CANCEL,
-                        "Cancel",
-                        ButtonStyle::Secondary,
-                    ),
-                ])],
+                vec![xiii_tickets::discord_io::embed_from_draft(
+                    &xiii_tickets::render::close_confirmation_embed(),
+                )],
+                Some(xiii_tickets::discord_io::close_confirmation_components()),
             )
             .await;
         }
         TicketComponentRoute::CloseConfirm => {
-            let response = match ticket_close_current_channel(interaction, runtime).await {
-                Ok(message) => message,
-                Err(err) => err,
-            };
-            respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
+            match ticket_close_current_channel(interaction, runtime).await {
+                Ok(embed) => {
+                    respond_interaction_update_embeds_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        vec![embed],
+                        Some(xiii_tickets::discord_io::after_close_components()),
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &err)
+                        .await;
+                }
+            }
         }
         TicketComponentRoute::CloseCancel => {
-            respond_interaction_ephemeral_http(
+            respond_interaction_update_embeds_http(
                 runtime.http.as_ref(),
                 interaction,
-                "Close cancelled.",
+                vec![xiii_tickets::discord_io::embed_from_draft(
+                    &xiii_tickets::render::close_cancelled_embed(),
+                )],
+                None,
             )
             .await;
         }
@@ -9266,10 +10411,10 @@ async fn handle_ticket_component(
                 runtime.http.as_ref(),
                 interaction,
                 &format!("ticket_staff_notes_modal:{channel_id}"),
-                "Ticket staff note",
+                xiii_tickets::render::STAFF_NOTES_MODAL_TITLE,
                 vec![action_row(vec![text_input(
                     "note",
-                    "Note",
+                    xiii_tickets::render::STAFF_NOTES_MODAL_LABEL,
                     TextInputStyle::Paragraph,
                     true,
                 )])],
@@ -9283,7 +10428,7 @@ async fn handle_ticket_component(
                         .delete_message(message.channel_id.get(), message.id.get())
                         .await
                     {
-                        Ok(()) => "Staff note deleted.".to_owned(),
+                        Ok(()) => xiii_tickets::render::STAFF_NOTE_DELETED_TEXT.to_owned(),
                         Err(err) => err,
                     },
                     None => "ticket Discord adapter is unavailable".to_owned(),
@@ -9477,7 +10622,7 @@ async fn handle_ticket_create_for_user(
 ) {
     let response = match ticket_create_for_user(opener_id, ticket_type, custom_name, runtime).await
     {
-        Ok(channel_id) => format!("Ticket created: <#{channel_id}>"),
+        Ok(channel_id) => format!("Тикет создан: <#{channel_id}>"),
         Err(err) => err,
     };
     respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
@@ -9553,9 +10698,13 @@ async fn ticket_create_for_user(
 async fn ticket_close_current_channel(
     interaction: &Interaction,
     runtime: &MixedSuperbotRuntime,
-) -> Result<String, String> {
+) -> Result<Embed, String> {
     let channel_id = interaction_channel_id(interaction)
         .ok_or_else(|| "This action must be used in a ticket channel.".to_owned())?;
+    let closer_id = interaction
+        .author_id()
+        .map(|id| id.get())
+        .unwrap_or_default();
     let repo = runtime
         .ticket_repo
         .as_ref()
@@ -9568,26 +10717,52 @@ async fn ticket_close_current_channel(
         .get_ticket_by_channel_id(channel_id)
         .await?
         .ok_or_else(|| "This channel is not a tracked ticket channel.".to_owned())?;
+    let closed_at = chrono::Utc::now();
     let messages = discord
         .fetch_transcript_messages(channel_id, xiii_tickets::runtime::TRANSCRIPT_FETCH_LIMIT)
         .await
         .unwrap_or_default();
+    let participant_count = (!messages.is_empty()).then(|| {
+        messages
+            .iter()
+            .map(|message| message.author_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+    });
     let html = xiii_tickets::render::transcript_html(&ticket, &messages);
     let ticket_name = ticket
         .ticket_name
         .clone()
         .unwrap_or_else(|| format!("ticket-{}", ticket.ticket_id));
-    discord
-        .send_transcript(&xiii_tickets::discord_io::transcript_payload(
+    let transcript_summary = xiii_tickets::render::transcript_summary_embed(
+        &ticket,
+        closer_id,
+        closed_at,
+        participant_count,
+    );
+    let transcript_summary_embed = xiii_tickets::discord_io::embed_from_draft(&transcript_summary);
+    let transcript_payload = xiii_tickets::discord_io::transcript_payload(
+        runtime.config.tickets.transcript_channel_id,
+        &ticket_name,
+        html,
+    );
+    let transcript_saved = if discord
+        .send_channel_embed_message(
             runtime.config.tickets.transcript_channel_id,
-            &ticket_name,
-            html,
-        ))
-        .await?;
+            &transcript_summary_embed,
+            None,
+        )
+        .await
+        .is_ok()
+    {
+        discord.send_transcript(&transcript_payload).await.is_ok()
+    } else {
+        false
+    };
     let closed = repo
         .mark_ticket_closed_by_channel(
             channel_id,
-            chrono::Utc::now(),
+            closed_at,
             xiii_tickets::runtime::DEFAULT_REOPEN_WINDOW_HOURS,
         )
         .await?;
@@ -9600,15 +10775,27 @@ async fn ticket_close_current_channel(
                 &xiii_tickets::discord_io::closed_ticket_owner_overwrite(closed.opener_id),
             )
             .await;
-        let _ = discord
-            .dm_user(&xiii_tickets::discord_io::dm_payload(
-                closed.opener_id,
-                xiii_tickets::runtime::close_dm_text(&ticket_name),
-            ))
-            .await;
-        Ok(xiii_tickets::render::close_result_text(&closed))
+        let dm_sent = if transcript_saved {
+            discord
+                .send_dm_embed_message(
+                    closed.opener_id,
+                    &transcript_summary_embed,
+                    Some(xiii_tickets::discord_io::dm_reopen_components()),
+                )
+                .await
+                .is_ok()
+                && discord
+                    .send_dm_transcript(closed.opener_id, &transcript_payload)
+                    .await
+                    .is_ok()
+        } else {
+            false
+        };
+        Ok(xiii_tickets::discord_io::embed_from_draft(
+            &xiii_tickets::render::close_result_embed(transcript_saved, dm_sent),
+        ))
     } else {
-        Ok("Ticket was already closed or is not open.".to_owned())
+        Err("Ticket was already closed or is not open.".to_owned())
     }
 }
 
@@ -9630,25 +10817,27 @@ async fn ticket_delete_current_channel(
         .get_ticket_by_channel_id(channel_id)
         .await?
         .ok_or_else(|| "This channel is not a tracked ticket channel.".to_owned())?;
-    let messages = discord
-        .fetch_transcript_messages(channel_id, xiii_tickets::runtime::TRANSCRIPT_FETCH_LIMIT)
-        .await
-        .unwrap_or_default();
-    let html = xiii_tickets::render::transcript_html(&ticket, &messages);
     let ticket_name = ticket
         .ticket_name
         .clone()
         .unwrap_or_else(|| format!("ticket-{}", ticket.ticket_id));
-    discord
-        .send_transcript(&xiii_tickets::discord_io::transcript_payload(
-            runtime.config.tickets.transcript_channel_id,
-            &ticket_name,
-            html,
-        ))
-        .await?;
+    if ticket.status != xiii_tickets::state::TicketStatus::Closed {
+        let messages = discord
+            .fetch_transcript_messages(channel_id, xiii_tickets::runtime::TRANSCRIPT_FETCH_LIMIT)
+            .await
+            .unwrap_or_default();
+        let html = xiii_tickets::render::transcript_html(&ticket, &messages);
+        discord
+            .send_transcript(&xiii_tickets::discord_io::transcript_payload(
+                runtime.config.tickets.transcript_channel_id,
+                &ticket_name,
+                html,
+            ))
+            .await?;
+    }
     if repo.mark_ticket_deleted_by_channel(channel_id).await? {
         discord.delete_channel(channel_id).await?;
-        Ok("Ticket deleted after transcript delivery.".to_owned())
+        Ok(xiii_tickets::render::DELETE_SUCCESS_TEXT.to_owned())
     } else {
         Ok("Ticket was already deleted or not in a deletable state.".to_owned())
     }
@@ -9682,6 +10871,10 @@ async fn ticket_reopen_current_channel(
         .reopen_ticket_record(ticket.ticket_id, Some(channel_id), Some(&base_name))
         .await?
     {
+        let actor_id = interaction
+            .author_id()
+            .map(|id| id.get())
+            .unwrap_or_default();
         let _ = discord.rename_channel(channel_id, &base_name).await;
         let _ = discord
             .set_channel_permissions(
@@ -9690,12 +10883,19 @@ async fn ticket_reopen_current_channel(
             )
             .await;
         let _ = discord
+            .send_channel_message(
+                channel_id,
+                &xiii_tickets::render::reopen_channel_message(actor_id),
+                &[],
+            )
+            .await;
+        let _ = discord
             .dm_user(&xiii_tickets::discord_io::dm_payload(
                 ticket.opener_id,
                 xiii_tickets::runtime::reopen_dm_text(&base_name),
             ))
             .await;
-        Ok("Ticket reopened.".to_owned())
+        Ok(xiii_tickets::render::REOPEN_SUCCESS_TEXT.to_owned())
     } else {
         Ok("Ticket was not in a reopenable closed state.".to_owned())
     }
@@ -9731,7 +10931,7 @@ async fn ticket_reopen_from_dm(
             ticket.ticket_name.as_deref(),
         )
         .await?;
-    Ok(format!("Ticket reopened: <#{channel_id}>"))
+    Ok(format!("Тикет переоткрыт: <#{channel_id}>"))
 }
 
 async fn ticket_application_decision(
@@ -9776,7 +10976,7 @@ async fn ticket_application_decision(
                 &[],
             )
             .await;
-        Ok("Application accepted.".to_owned())
+        Ok("Готово: игрок принят ✅".to_owned())
     } else {
         let _ = discord
             .send_channel_message(
@@ -9785,7 +10985,7 @@ async fn ticket_application_decision(
                 &[],
             )
             .await;
-        Ok("Application rejected.".to_owned())
+        Ok("Готово: игрок отклонён ❌".to_owned())
     }
 }
 
@@ -9805,9 +11005,17 @@ async fn handle_ticket_staff_notes_modal(
         "Missing ticket channel or note text.".to_owned()
     } else if let Some(discord) = runtime.ticket_discord.as_ref() {
         discord
-            .send_channel_message(channel_id, &format!("Staff note: {}", note.trim()), &[])
+            .send_channel_message(
+                channel_id,
+                &format!(
+                    "{} {}",
+                    xiii_tickets::render::STAFF_NOTE_PREFIX,
+                    note.trim()
+                ),
+                &[],
+            )
             .await
-            .map(|_| "Staff note added.".to_owned())
+            .map(|_| xiii_tickets::render::STAFF_NOTE_ADDED_TEXT.to_owned())
             .unwrap_or_else(|err| err)
     } else {
         "ticket Discord adapter is unavailable".to_owned()
@@ -11544,7 +12752,7 @@ async fn bootstrap_discipline_board(
         xiii_discipline::render::board_title(),
         xiii_discipline::render::EMPTY_BOARD_DESCRIPTION,
         xiii_discipline::render::LEGACY_BOARD_COLOR,
-        Some("Страница 1/1 • Обновлено {ru-RU}"),
+        Some(xiii_discipline::render::BOARD_FOOTER_PREVIEW),
         true,
     );
     let components = vec![action_row(vec![
@@ -11617,12 +12825,16 @@ async fn bootstrap_voice_activity_panel(
 
     let embed = embed_with_appearance(
         "XIII Voice Activity",
-        "Период: 7 дней · Страница 1/1\nПанель автоматически обновляется из сохранённой голосовой статистики.\n\nНет доступных участников для отображения.",
+        &format!(
+            "Период: 7 дней · Страница 1/1\n{}\n\n{}",
+            xiii_voice_activity::render::PANEL_REFRESH_NOTICE,
+            xiii_voice_activity::render::PUBLIC_EMPTY_MESSAGE
+        ),
         xiii_voice_activity::render::LEGACY_EMBED_COLOR,
         Some(xiii_voice_activity::render::LEGACY_FOOTER),
         true,
     );
-    let components = voice_activity_public_stats_components("7d");
+    let components = voice_activity_public_stats_components("7d", 0, 1);
     let message = client
         .create_message(Id::<ChannelMarker>::new(
             config.voice_activity.stats_panel_channel_id,
@@ -13431,7 +14643,8 @@ mod tests {
                 && row.status == LegacyParityStatus::AcceptedDifference));
         assert!(rows
             .iter()
-            .any(|row| row.module == "tickets" && row.status == LegacyParityStatus::Partial));
+            .any(|row| row.module == "tickets"
+                && row.status == LegacyParityStatus::AcceptedDifference));
         assert!(rows
             .iter()
             .any(|row| row.module == "vacation" && row.status == LegacyParityStatus::Exact));
@@ -13639,7 +14852,7 @@ mod tests {
         let config = config_with_legacy_dir(&dir, &legacy_dir);
         let output = dir.join("report.json");
 
-        emit_output(r#"{"title":"Список"}"#, Some(&output), Some(&config)).unwrap();
+        emit_output("{\"title\":\"Список\"}", Some(&output), Some(&config)).unwrap();
 
         let text = fs::read_to_string(&output).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();

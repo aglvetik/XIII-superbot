@@ -180,37 +180,23 @@ pub fn ticket_number_from_google_row(row: &GoogleFormRow) -> Option<i64> {
 }
 
 pub fn officer_review_description(row: &GoogleFormRow, ticket_number: Option<i64>) -> String {
-    let ticket = ticket_number
-        .map(|number| number.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let preview = row
-        .values
-        .iter()
-        .take(6)
-        .enumerate()
-        .map(|(idx, value)| format!("{}: {}", idx + 1, value))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "Google Forms row {}\nTicket number: {}\n\n{}",
-        row.sheet_row, ticket, preview
-    )
+    crate::render::officer_review_description(&row.values, ticket_number)
 }
 
 pub fn accept_application_text() -> &'static str {
-    "Application accepted. The applicant roles/nickname were updated when permissions allowed."
+    crate::render::accept_application_channel_text()
 }
 
 pub fn reject_application_text() -> &'static str {
-    "Application rejected."
+    crate::render::reject_application_channel_text()
 }
 
 pub fn close_dm_text(ticket_name: &str) -> String {
-    format!("Your ticket `{ticket_name}` was closed. Thank you for contacting XIII.")
+    crate::render::close_dm_content(ticket_name)
 }
 
 pub fn reopen_dm_text(ticket_name: &str) -> String {
-    format!("Your ticket `{ticket_name}` was reopened.")
+    crate::render::reopen_dm_content(ticket_name)
 }
 
 fn non_zero(value: u64) -> Option<u64> {

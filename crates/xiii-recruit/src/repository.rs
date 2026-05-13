@@ -402,6 +402,48 @@ impl LegacySqliteRecruitRepository {
         row.map(|row| voice_from_row(&row)).transpose()
     }
 
+    pub async fn voice_seconds_for_recruit(
+        &self,
+        recruit: &RecruitRecord,
+        now: DateTime<Utc>,
+    ) -> Result<i64, String> {
+        let rows = sqlx::query(
+            voice_select_sql(
+                "WHERE CAST(guild_id AS TEXT)=? AND CAST(user_id AS TEXT)=?
+                   AND started_at >= ? AND started_at <= ?
+                 ORDER BY started_at ASC, id ASC",
+            )
+            .as_str(),
+        )
+        .bind(recruit.guild_id.to_string())
+        .bind(recruit.user_id.to_string())
+        .bind(&recruit.started_at)
+        .bind(format_time(now))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| format!("failed to list recruit voice sessions: {err}"))?;
+
+        let mut total = 0_i64;
+        let now_unix = now.timestamp();
+        for row in rows {
+            let session = voice_from_row(&row)?;
+            let duration = match (session.duration_seconds, session.ended_at.as_deref()) {
+                (Some(duration), _) => duration.max(0),
+                (_, Some(ended_at)) => parse_rfc3339_unix(ended_at)
+                    .map(|ended_unix| {
+                        (ended_unix - parse_rfc3339_unix(&session.started_at).unwrap_or(ended_unix))
+                            .max(0)
+                    })
+                    .unwrap_or(0),
+                _ => {
+                    (now_unix - parse_rfc3339_unix(&session.started_at).unwrap_or(now_unix)).max(0)
+                }
+            };
+            total += duration;
+        }
+        Ok(total)
+    }
+
     pub async fn open_voice_session(
         &self,
         guild_id: u64,

@@ -24,7 +24,8 @@ pub struct RecruitRoleTransition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecruitDmDraft {
     pub user_id: u64,
-    pub body: String,
+    pub content: Option<String>,
+    pub embed: Option<Embed>,
 }
 
 pub fn accept_transition(
@@ -52,10 +53,19 @@ pub fn reject_transition(
     }
 }
 
-pub fn decision_dm(user_id: u64, body: &str) -> RecruitDmDraft {
+pub fn decision_dm_content(user_id: u64, body: &str) -> RecruitDmDraft {
     RecruitDmDraft {
         user_id,
-        body: body.to_owned(),
+        content: Some(body.to_owned()),
+        embed: None,
+    }
+}
+
+pub fn decision_dm_embed(user_id: u64, embed: Embed) -> RecruitDmDraft {
+    RecruitDmDraft {
+        user_id,
+        content: None,
+        embed: Some(embed),
     }
 }
 
@@ -155,17 +165,46 @@ impl RecruitDiscordHttp {
             .model()
             .await
             .map_err(|err| format!("failed to decode recruit DM channel: {err}"))?;
-        let message = self
+        let allowed_mentions = AllowedMentions::default();
+        let embeds;
+        let mut request = self
             .client
             .create_message(channel.id)
-            .allowed_mentions(Some(&AllowedMentions::default()))
-            .content(&draft.body)
+            .allowed_mentions(Some(&allowed_mentions));
+        if let Some(content) = draft.content.as_deref() {
+            request = request.content(content);
+        }
+        if let Some(embed) = draft.embed.clone() {
+            embeds = vec![embed];
+            request = request.embeds(&embeds);
+        }
+        let message = request
             .await
             .map_err(|err| format!("failed to send recruit DM to {}: {err}", draft.user_id))?
             .model()
             .await
             .map_err(|err| format!("failed to decode recruit DM message: {err}"))?;
         Ok(Some(message.id.get()))
+    }
+
+    pub async fn edit_decision_panel(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        embed: &Embed,
+    ) -> Result<(), String> {
+        self.client
+            .update_message(
+                Id::<ChannelMarker>::new(channel_id),
+                Id::<twilight_model::id::marker::MessageMarker>::new(message_id),
+            )
+            .allowed_mentions(Some(&AllowedMentions::default()))
+            .content(None)
+            .embeds(Some(std::slice::from_ref(embed)))
+            .components(Some(&[]))
+            .await
+            .map(|_| ())
+            .map_err(|err| format!("failed to edit recruit decision panel {message_id}: {err}"))
     }
 
     pub async fn respond_ephemeral(

@@ -1,19 +1,28 @@
-﻿use crate::commands::{
+use crate::commands::{
     can_accept_application, can_moderate_tickets, can_use_custom_ticket_command, is_accept_prefix,
     is_panel_prefix, is_reject_prefix,
 };
 use crate::discord_io::{
-    allowed_mentions_are_limited, close_confirmation_payload, closed_ticket_owner_overwrite,
-    officer_review_payload, permission_overwrites_for_ticket, reopen_ticket_owner_overwrite,
-    ticket_open_payload, ticket_panel_button_specs, transcript_payload, TicketChannelCreateRequest,
+    after_close_components, allowed_mentions_are_limited, close_confirmation_components,
+    close_confirmation_payload, closed_ticket_owner_overwrite, dm_reopen_components,
+    embed_from_draft, officer_review_payload, permission_overwrites_for_ticket,
+    reopen_ticket_owner_overwrite, ticket_open_payload, ticket_panel_button_specs,
+    transcript_payload, TicketChannelCreateRequest,
 };
 use crate::google::{
     google_sheet_range, google_sheets_read_plan, values_to_rows, GoogleSheetsPollConfig,
 };
 use crate::interactions::{route_ticket_component, route_ticket_panel, TicketComponentRoute};
 use crate::render::{
-    member_history, panel_description, panel_title, transcript_html, transcript_model,
-    transcript_text, TranscriptMessage, LEGACY_PANEL_COLOR,
+    close_cancelled_embed, close_confirmation_embed, close_result_embed, member_history,
+    panel_description, panel_title, transcript_html, transcript_model, transcript_summary_embed,
+    transcript_text, TranscriptMessage, CLOSE_CONFIRM_DESCRIPTION, CLOSE_CONFIRM_TITLE,
+    CLOSE_RESULT_FAILED_TITLE, CLOSE_RESULT_SAVED_TITLE, CLOSE_RESULT_SENT_TITLE,
+    LEGACY_CLOSE_FAILURE_COLOR, LEGACY_CLOSE_SUCCESS_COLOR, LEGACY_CLOSE_WARNING_COLOR,
+    LEGACY_COMPLAINT_COLOR, LEGACY_OFFICER_REVIEW_COLOR, LEGACY_PANEL_COLOR, TICKET_CREATED_TITLE,
+    TRANSCRIPT_FIELD_CLOSED_AT, TRANSCRIPT_FIELD_CLOSED_BY, TRANSCRIPT_FIELD_NUMBER,
+    TRANSCRIPT_FIELD_OPENED_AT, TRANSCRIPT_FIELD_OPENED_BY, TRANSCRIPT_FIELD_PARTICIPANTS,
+    TRANSCRIPT_FIELD_TICKET, TRANSCRIPT_FIELD_TYPE,
 };
 use crate::repository::{google_form_signature, LegacySqliteTicketRepository};
 use crate::runtime::{
@@ -26,8 +35,26 @@ use chrono::{TimeZone, Utc};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use twilight_model::channel::message::component::Component;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn component_button_specs(components: &[Component]) -> Vec<(String, String)> {
+    let mut output = Vec::new();
+    for component in components {
+        if let Component::ActionRow(row) = component {
+            for nested in &row.components {
+                if let Component::Button(button) = nested {
+                    output.push((
+                        button.custom_id.clone().unwrap_or_default(),
+                        button.label.clone().unwrap_or_default(),
+                    ));
+                }
+            }
+        }
+    }
+    output
+}
 
 #[test]
 fn ticket_counter_continues_from_legacy_value() {
@@ -64,6 +91,62 @@ fn ticket_panel_visual_constants_match_legacy_source() {
     assert_eq!(buttons[1].label, "🚨 Подать жалобу");
     assert_eq!(buttons[2].custom_id, "panel_idea");
     assert_eq!(buttons[2].label, "Заявка на повышение");
+}
+
+#[test]
+fn ticket_close_lifecycle_visuals_match_legacy_source() {
+    let confirm = close_confirmation_embed();
+    assert_eq!(confirm.title, CLOSE_CONFIRM_TITLE);
+    assert_eq!(
+        confirm.description.as_deref(),
+        Some(CLOSE_CONFIRM_DESCRIPTION)
+    );
+    assert_eq!(confirm.color, LEGACY_COMPLAINT_COLOR);
+
+    let sent = close_result_embed(true, true);
+    assert_eq!(sent.title, CLOSE_RESULT_SENT_TITLE);
+    assert_eq!(sent.color, LEGACY_CLOSE_SUCCESS_COLOR);
+
+    let saved = close_result_embed(true, false);
+    assert_eq!(saved.title, CLOSE_RESULT_SAVED_TITLE);
+    assert_eq!(saved.color, LEGACY_CLOSE_WARNING_COLOR);
+
+    let failed = close_result_embed(false, false);
+    assert_eq!(failed.title, CLOSE_RESULT_FAILED_TITLE);
+    assert_eq!(failed.color, LEGACY_CLOSE_FAILURE_COLOR);
+
+    let cancelled = close_cancelled_embed();
+    assert!(cancelled.title.contains("отменено"));
+
+    let close_buttons = component_button_specs(&close_confirmation_components());
+    assert_eq!(
+        close_buttons,
+        vec![
+            ("ticket_close_confirm".to_owned(), "Да, закрыть".to_owned()),
+            ("ticket_close_cancel".to_owned(), "Отмена".to_owned()),
+        ]
+    );
+
+    let after_close_buttons = component_button_specs(&after_close_components());
+    assert_eq!(
+        after_close_buttons,
+        vec![
+            ("ticket_delete".to_owned(), "🗑️ Удалить тикет".to_owned()),
+            (
+                "ticket_reopen_mod".to_owned(),
+                "🔓 Переоткрыть тикет".to_owned()
+            ),
+        ]
+    );
+
+    let dm_buttons = component_button_specs(&dm_reopen_components());
+    assert_eq!(
+        dm_buttons,
+        vec![(
+            "dm_reopen_generic".to_owned(),
+            "🔓 Переоткрыть тикет".to_owned()
+        )]
+    );
 }
 
 #[test]
@@ -132,18 +215,36 @@ fn permission_and_allowed_mentions_models_are_limited() {
     assert!(channel.permission_plan().deny_everyone_read);
 
     let payload = ticket_open_payload(&plan, TicketType::Application);
-    assert_eq!(payload.allowed_role_mentions, vec![777]);
+    assert!(payload.allowed_role_mentions.is_empty());
+    assert!(payload.title.is_none());
+    assert!(payload.description.is_none());
+    assert_eq!(payload.color, LEGACY_PANEL_COLOR);
+    assert!(payload
+        .content
+        .as_deref()
+        .unwrap_or_default()
+        .contains("заполни короткую анкету"));
+
+    let complaint = ticket_open_payload(&plan, TicketType::Complaint);
+    assert_eq!(complaint.allowed_role_mentions, vec![777]);
     assert!(allowed_mentions_are_limited(
-        &payload.allowed_role_mentions,
+        &complaint.allowed_role_mentions,
         &[777]
     ));
     assert!(!allowed_mentions_are_limited(
-        &payload.allowed_role_mentions,
+        &complaint.allowed_role_mentions,
         &[778]
     ));
-    assert!(close_confirmation_payload()
-        .allowed_role_mentions
-        .is_empty());
+    assert_eq!(complaint.title.as_deref(), Some(TICKET_CREATED_TITLE));
+    assert_eq!(complaint.color, LEGACY_COMPLAINT_COLOR);
+
+    let close = close_confirmation_payload();
+    assert!(close.allowed_role_mentions.is_empty());
+    assert_eq!(close.title.as_deref(), Some(CLOSE_CONFIRM_TITLE));
+    assert_eq!(
+        close.description.as_deref(),
+        Some(CLOSE_CONFIRM_DESCRIPTION)
+    );
 }
 
 #[test]
@@ -247,6 +348,8 @@ fn transcript_and_officer_payloads_do_not_leak_secret_markers() {
 
     assert_eq!(transcript.filename, "transcript-application-24.html");
     assert_eq!(officer.allowed_role_mentions, vec![700]);
+    assert_eq!(officer.title, None);
+    assert_eq!(officer.color, LEGACY_OFFICER_REVIEW_COLOR);
     assert!(!transcript.body.contains("DISCORD_TOKEN"));
     assert!(!officer.description.contains("PRIVATE_KEY"));
 }
@@ -282,6 +385,56 @@ fn transcript_html_sanitizes_mentions_and_preserves_attachments() {
     assert!(!html.contains("<@&123>"));
     assert!(!html.contains("<@42>"));
     assert!(!html.contains("DISCORD_TOKEN"));
+}
+
+#[test]
+fn transcript_summary_embed_matches_legacy_fields() {
+    let ticket = crate::state::TicketRecord {
+        ticket_id: 24,
+        ticket_name: Some("application-24".to_owned()),
+        opener_id: 42,
+        ticket_type: TicketType::Application,
+        channel_id: Some(9001),
+        status: TicketStatus::Closed,
+        created_at_utc: "2026-05-10T12:00:00Z".to_owned(),
+        closed_at_utc: Some("2026-05-10T13:00:00Z".to_owned()),
+        reopen_until_utc: None,
+    };
+    let draft = transcript_summary_embed(
+        &ticket,
+        77,
+        Utc.with_ymd_and_hms(2026, 5, 10, 13, 0, 0).unwrap(),
+        Some(4),
+    );
+    let embed = embed_from_draft(&draft);
+
+    assert_eq!(draft.title, "Тикет закрыт");
+    assert_eq!(embed.title.as_deref(), Some("Тикет закрыт"));
+    let field_names = draft
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        field_names,
+        vec![
+            TRANSCRIPT_FIELD_TICKET,
+            TRANSCRIPT_FIELD_NUMBER,
+            TRANSCRIPT_FIELD_TYPE,
+            TRANSCRIPT_FIELD_OPENED_BY,
+            TRANSCRIPT_FIELD_CLOSED_BY,
+            TRANSCRIPT_FIELD_PARTICIPANTS,
+            TRANSCRIPT_FIELD_OPENED_AT,
+            TRANSCRIPT_FIELD_CLOSED_AT,
+        ]
+    );
+    assert!(draft.fields.iter().any(|field| field.value == "<@42>"));
+    assert!(draft.fields.iter().any(|field| field.value == "<@77>"));
+    assert!(draft.fields.iter().any(|field| field.value == "4"));
+    assert!(draft
+        .fields
+        .iter()
+        .any(|field| field.value == "Заявка на вступление"));
 }
 
 #[tokio::test]

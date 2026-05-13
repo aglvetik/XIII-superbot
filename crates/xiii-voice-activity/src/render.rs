@@ -84,6 +84,32 @@ pub fn leaderboard_total_pages(
     count.max(1).div_ceil(page_size)
 }
 
+pub fn inactive_total_pages(
+    members: &[VoiceMemberForReport],
+    completed: &[CompletedVoiceSession],
+    active: &[ActiveVoiceSession],
+    inactive_role_id: u64,
+    vacation_marker_role_id: u64,
+    period_key: &str,
+    page_size: usize,
+    now: DateTime<Utc>,
+) -> usize {
+    let count = inactive_entries(
+        members,
+        completed,
+        active,
+        inactive_role_id,
+        vacation_marker_role_id,
+        period_key,
+        0,
+        usize::MAX,
+        now,
+    )
+    .len();
+    let page_size = page_size.max(1);
+    count.max(1).div_ceil(page_size)
+}
+
 pub fn inactive_entries(
     members: &[VoiceMemberForReport],
     completed: &[CompletedVoiceSession],

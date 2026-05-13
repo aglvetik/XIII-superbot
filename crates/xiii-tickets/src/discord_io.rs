@@ -1,12 +1,15 @@
 use crate::interactions::{PANEL_APPLY, PANEL_IDEA, PANEL_QUESTION, TICKET_CLOSE};
-use crate::render::{panel_description, panel_title, TranscriptMessage, LEGACY_PANEL_COLOR};
+use crate::render::{
+    panel_description, panel_title, RenderField, TicketEmbedDraft, TranscriptMessage,
+    LEGACY_PANEL_COLOR,
+};
 use crate::runtime::TicketCreationPlan;
 use crate::state::TicketType;
 use std::sync::Arc;
 use twilight_http::request::AuditLogReason;
 use twilight_http::Client as DiscordHttpClient;
 use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle, Component};
-use twilight_model::channel::message::embed::Embed;
+use twilight_model::channel::message::embed::{Embed, EmbedField, EmbedFooter};
 use twilight_model::channel::message::{AllowedMentions, Message as DiscordMessage};
 use twilight_model::channel::permission_overwrite::{
     PermissionOverwrite as ChannelPermissionOverwrite,
@@ -50,8 +53,9 @@ pub struct TicketPermissionPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketMessagePayload {
     pub content: Option<String>,
-    pub title: String,
-    pub description: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub color: u32,
     pub allowed_role_mentions: Vec<u64>,
 }
 
@@ -65,8 +69,9 @@ pub struct TicketTranscriptPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfficerReviewPayload {
     pub officer_review_channel_id: u64,
-    pub title: String,
+    pub title: Option<String>,
     pub description: String,
+    pub color: u32,
     pub allowed_role_mentions: Vec<u64>,
 }
 
@@ -126,7 +131,12 @@ impl TicketDiscordHttp {
     }
 
     pub async fn send_ticket_panel(&self, channel_id: u64) -> Result<DiscordMessage, String> {
-        let embed = simple_embed(panel_title(), panel_description());
+        let embed = simple_embed(
+            Some(panel_title()),
+            Some(panel_description()),
+            LEGACY_PANEL_COLOR,
+        )
+        .ok_or_else(|| "ticket panel embed could not be constructed".to_owned())?;
         let components = panel_components();
         self.client
             .create_message(Id::<ChannelMarker>::new(channel_id))
@@ -145,7 +155,12 @@ impl TicketDiscordHttp {
         channel_id: u64,
         message_id: u64,
     ) -> Result<DiscordMessage, String> {
-        let embed = simple_embed(panel_title(), panel_description());
+        let embed = simple_embed(
+            Some(panel_title()),
+            Some(panel_description()),
+            LEGACY_PANEL_COLOR,
+        )
+        .ok_or_else(|| "ticket panel embed could not be constructed".to_owned())?;
         let components = panel_components();
         self.client
             .update_message(
@@ -169,21 +184,28 @@ impl TicketDiscordHttp {
         payload: &TicketMessagePayload,
     ) -> Result<DiscordMessage, String> {
         let allowed = allowed_mentions_for_roles(&payload.allowed_role_mentions);
-        let embed = simple_embed(&payload.title, &payload.description);
+        let embed = simple_embed(
+            payload.title.as_deref(),
+            payload.description.as_deref(),
+            payload.color,
+        );
         let components = vec![action_row(vec![button(
             TICKET_CLOSE,
-            "🔒 Закрыть тикет",
+            crate::render::TICKET_CLOSE_LABEL,
             ButtonStyle::Danger,
         )])];
-        let embeds = [embed];
         let mut request = self
             .client
             .create_message(Id::<ChannelMarker>::new(channel_id))
             .allowed_mentions(Some(&allowed))
-            .embeds(&embeds)
             .components(&components);
+        let embeds;
         if let Some(content) = payload.content.as_deref() {
             request = request.content(content);
+        }
+        if let Some(embed) = embed {
+            embeds = [embed];
+            request = request.embeds(&embeds);
         }
         request
             .await
@@ -211,12 +233,41 @@ impl TicketDiscordHttp {
             .map_err(|err| format!("failed to decode ticket channel message: {err}"))
     }
 
+    pub async fn send_channel_embed_message(
+        &self,
+        channel_id: u64,
+        embed: &Embed,
+        components: Option<Vec<Component>>,
+    ) -> Result<DiscordMessage, String> {
+        let embeds = [embed.clone()];
+        let allowed = AllowedMentions::default();
+        let mut request = self
+            .client
+            .create_message(Id::<ChannelMarker>::new(channel_id))
+            .allowed_mentions(Some(&allowed))
+            .embeds(&embeds);
+        if let Some(components) = components.as_ref() {
+            request = request.components(components);
+        }
+        request
+            .await
+            .map_err(|err| format!("failed to send ticket embed message: {err}"))?
+            .model()
+            .await
+            .map_err(|err| format!("failed to decode ticket embed message: {err}"))
+    }
+
     pub async fn send_officer_review(
         &self,
         payload: &OfficerReviewPayload,
     ) -> Result<DiscordMessage, String> {
         let allowed = allowed_mentions_for_roles(&payload.allowed_role_mentions);
-        let embed = simple_embed(&payload.title, &payload.description);
+        let embed = simple_embed(
+            payload.title.as_deref(),
+            Some(&payload.description),
+            payload.color,
+        )
+        .ok_or_else(|| "ticket officer review embed could not be constructed".to_owned())?;
         self.client
             .create_message(Id::<ChannelMarker>::new(payload.officer_review_channel_id))
             .allowed_mentions(Some(&allowed))
@@ -229,17 +280,10 @@ impl TicketDiscordHttp {
     }
 
     pub async fn dm_user(&self, payload: &TicketDmPayload) -> Result<Option<u64>, String> {
-        let channel = self
-            .client
-            .create_private_channel(Id::<UserMarker>::new(payload.user_id))
-            .await
-            .map_err(|err| format!("failed to open ticket DM for {}: {err}", payload.user_id))?
-            .model()
-            .await
-            .map_err(|err| format!("failed to decode ticket DM channel: {err}"))?;
+        let channel_id = self.open_dm_channel(payload.user_id).await?;
         let message = self
             .client
-            .create_message(channel.id)
+            .create_message(channel_id)
             .allowed_mentions(Some(&AllowedMentions::default()))
             .content(&payload.content)
             .await
@@ -247,6 +291,57 @@ impl TicketDiscordHttp {
             .model()
             .await
             .map_err(|err| format!("failed to decode ticket DM message: {err}"))?;
+        Ok(Some(message.id.get()))
+    }
+
+    pub async fn send_dm_embed_message(
+        &self,
+        user_id: u64,
+        embed: &Embed,
+        components: Option<Vec<Component>>,
+    ) -> Result<Option<u64>, String> {
+        let channel_id = self.open_dm_channel(user_id).await?;
+        let embeds = [embed.clone()];
+        let allowed = AllowedMentions::default();
+        let mut request = self
+            .client
+            .create_message(channel_id)
+            .allowed_mentions(Some(&allowed))
+            .embeds(&embeds);
+        if let Some(components) = components.as_ref() {
+            request = request.components(components);
+        }
+        let message = request
+            .await
+            .map_err(|err| format!("failed to send ticket DM embed to {user_id}: {err}"))?
+            .model()
+            .await
+            .map_err(|err| format!("failed to decode ticket DM embed message: {err}"))?;
+        Ok(Some(message.id.get()))
+    }
+
+    pub async fn send_dm_transcript(
+        &self,
+        user_id: u64,
+        payload: &TicketTranscriptPayload,
+    ) -> Result<Option<u64>, String> {
+        let channel_id = self.open_dm_channel(user_id).await?;
+        let attachment = Attachment::from_bytes(
+            payload.filename.clone(),
+            payload.body.clone().into_bytes(),
+            0,
+        );
+        let attachments = [attachment];
+        let message = self
+            .client
+            .create_message(channel_id)
+            .allowed_mentions(Some(&AllowedMentions::default()))
+            .attachments(&attachments)
+            .await
+            .map_err(|err| format!("failed to send ticket DM transcript to {user_id}: {err}"))?
+            .model()
+            .await
+            .map_err(|err| format!("failed to decode ticket DM transcript message: {err}"))?;
         Ok(Some(message.id.get()))
     }
 
@@ -323,7 +418,6 @@ impl TicketDiscordHttp {
         self.client
             .create_message(Id::<ChannelMarker>::new(payload.transcript_channel_id))
             .allowed_mentions(Some(&AllowedMentions::default()))
-            .content("Ticket transcript attached.")
             .attachments(&attachments)
             .await
             .map_err(|err| format!("failed to send ticket transcript: {err}"))?
@@ -530,29 +624,55 @@ pub fn ticket_open_payload(
     plan: &TicketCreationPlan,
     ticket_type: TicketType,
 ) -> TicketMessagePayload {
-    let label = match ticket_type {
-        TicketType::Application => "Application ticket",
-        TicketType::Complaint => "Question ticket",
-        TicketType::Idea => "Idea ticket",
-        TicketType::Custom => "Custom ticket",
-    };
-    TicketMessagePayload {
-        content: None,
-        title: label.to_owned(),
-        description: format!(
-            "Ticket {} is open for <@{}>.",
-            plan.reserved.ticket_name, plan.opener_user_id
-        ),
-        allowed_role_mentions: plan.ping_role_id.into_iter().collect(),
+    let opener_mention = format!("<@{}>", plan.opener_user_id);
+    let ping_mention = plan
+        .ping_role_id
+        .map(|role_id| format!("<@&{role_id}>"))
+        .unwrap_or_else(|| "Офицеры".to_owned());
+    match ticket_type {
+        TicketType::Application => TicketMessagePayload {
+            content: Some(crate::render::application_form_message(&opener_mention)),
+            title: None,
+            description: None,
+            color: LEGACY_PANEL_COLOR,
+            allowed_role_mentions: Vec::new(),
+        },
+        TicketType::Complaint => TicketMessagePayload {
+            content: Some(crate::render::complaint_main_message(
+                &opener_mention,
+                &ping_mention,
+            )),
+            title: Some(crate::render::TICKET_CREATED_TITLE.to_owned()),
+            description: Some(crate::render::complaint_embed_description().to_owned()),
+            color: crate::render::LEGACY_COMPLAINT_COLOR,
+            allowed_role_mentions: plan.ping_role_id.into_iter().collect(),
+        },
+        TicketType::Idea => TicketMessagePayload {
+            content: Some(crate::render::promotion_request_message(
+                &opener_mention,
+                &ping_mention,
+            )),
+            title: None,
+            description: None,
+            color: crate::render::LEGACY_PROMOTION_COLOR,
+            allowed_role_mentions: plan.ping_role_id.into_iter().collect(),
+        },
+        TicketType::Custom => TicketMessagePayload {
+            content: None,
+            title: Some(crate::render::TICKET_CREATED_TITLE.to_owned()),
+            description: Some(crate::render::custom_ticket_description().to_owned()),
+            color: LEGACY_PANEL_COLOR,
+            allowed_role_mentions: Vec::new(),
+        },
     }
 }
 
 pub fn close_confirmation_payload() -> TicketMessagePayload {
     TicketMessagePayload {
         content: None,
-        title: "Закрыть тикет?".to_owned(),
-        description: "Подтвердите закрытие тикета. Перед удалением будет сохранён транскрипт."
-            .to_owned(),
+        title: Some(crate::render::CLOSE_CONFIRM_TITLE.to_owned()),
+        description: Some(crate::render::CLOSE_CONFIRM_DESCRIPTION.to_owned()),
+        color: crate::render::LEGACY_COMPLAINT_COLOR,
         allowed_role_mentions: Vec::new(),
     }
 }
@@ -571,14 +691,15 @@ pub fn transcript_payload(
 
 pub fn officer_review_payload(
     officer_review_channel_id: u64,
-    ticket_name: &str,
+    _ticket_name: &str,
     description: String,
     allowed_role_mentions: Vec<u64>,
 ) -> OfficerReviewPayload {
     OfficerReviewPayload {
         officer_review_channel_id,
-        title: format!("Officer review for {ticket_name}"),
+        title: None,
         description,
+        color: crate::render::LEGACY_OFFICER_REVIEW_COLOR,
         allowed_role_mentions,
     }
 }
@@ -588,6 +709,70 @@ pub fn dm_payload(user_id: u64, content: impl Into<String>) -> TicketDmPayload {
         user_id,
         content: content.into(),
     }
+}
+
+pub fn embed_from_draft(draft: &TicketEmbedDraft) -> Embed {
+    Embed {
+        author: None,
+        color: Some(draft.color),
+        description: draft.description.clone(),
+        fields: draft
+            .fields
+            .iter()
+            .map(embed_field_from_draft)
+            .collect::<Vec<_>>(),
+        footer: draft.footer.as_ref().map(|text| EmbedFooter {
+            icon_url: None,
+            proxy_icon_url: None,
+            text: text.clone(),
+        }),
+        image: None,
+        kind: "rich".to_owned(),
+        provider: None,
+        thumbnail: None,
+        timestamp: None,
+        title: Some(draft.title.clone()),
+        url: None,
+        video: None,
+    }
+}
+
+pub fn close_confirmation_components() -> Vec<Component> {
+    vec![action_row(vec![
+        button(
+            crate::interactions::TICKET_CLOSE_CONFIRM,
+            crate::render::TICKET_CLOSE_CONFIRM_LABEL,
+            ButtonStyle::Danger,
+        ),
+        button(
+            crate::interactions::TICKET_CLOSE_CANCEL,
+            crate::render::TICKET_CLOSE_CANCEL_LABEL,
+            ButtonStyle::Secondary,
+        ),
+    ])]
+}
+
+pub fn after_close_components() -> Vec<Component> {
+    vec![action_row(vec![
+        button(
+            crate::interactions::TICKET_DELETE,
+            crate::render::TICKET_DELETE_LABEL,
+            ButtonStyle::Danger,
+        ),
+        button(
+            crate::interactions::TICKET_REOPEN_MOD,
+            crate::render::TICKET_REOPEN_LABEL,
+            ButtonStyle::Success,
+        ),
+    ])]
+}
+
+pub fn dm_reopen_components() -> Vec<Component> {
+    vec![action_row(vec![button(
+        crate::interactions::DM_REOPEN_GENERIC,
+        crate::render::TICKET_REOPEN_LABEL,
+        ButtonStyle::Success,
+    )])]
 }
 
 pub fn allowed_mentions_are_limited(payload_roles: &[u64], configured_roles: &[u64]) -> bool {
@@ -650,11 +835,22 @@ fn http_permission_overwrite(overwrite: &ChannelPermissionOverwrite) -> HttpPerm
     }
 }
 
-fn simple_embed(title: &str, description: &str) -> Embed {
-    Embed {
+fn embed_field_from_draft(field: &RenderField) -> EmbedField {
+    EmbedField {
+        inline: field.inline,
+        name: field.name.clone(),
+        value: field.value.clone(),
+    }
+}
+
+fn simple_embed(title: Option<&str>, description: Option<&str>, color: u32) -> Option<Embed> {
+    if title.is_none() && description.is_none() {
+        return None;
+    }
+    Some(Embed {
         author: None,
-        color: Some(LEGACY_PANEL_COLOR),
-        description: Some(description.to_owned()),
+        color: Some(color),
+        description: description.map(str::to_owned),
         fields: Vec::new(),
         footer: None,
         image: None,
@@ -662,9 +858,22 @@ fn simple_embed(title: &str, description: &str) -> Embed {
         provider: None,
         thumbnail: None,
         timestamp: None,
-        title: Some(title.to_owned()),
+        title: title.map(str::to_owned),
         url: None,
         video: None,
+    })
+}
+
+impl TicketDiscordHttp {
+    async fn open_dm_channel(&self, user_id: u64) -> Result<Id<ChannelMarker>, String> {
+        self.client
+            .create_private_channel(Id::<UserMarker>::new(user_id))
+            .await
+            .map_err(|err| format!("failed to open ticket DM for {user_id}: {err}"))?
+            .model()
+            .await
+            .map(|channel| channel.id)
+            .map_err(|err| format!("failed to decode ticket DM channel: {err}"))
     }
 }
 

@@ -1,8 +1,59 @@
-use crate::state::{OfficerReviewDraft, Ticket, TicketRecord, TicketStatus};
+use crate::state::{OfficerReviewDraft, Ticket, TicketRecord, TicketStatus, TicketType};
+use chrono::{DateTime, Utc};
 
 pub const LEGACY_PANEL_COLOR: u32 = 0x3498DB;
+pub const LEGACY_COMPLAINT_COLOR: u32 = 0xE74C3C;
+pub const LEGACY_PROMOTION_COLOR: u32 = 0xF1C40F;
+pub const LEGACY_OFFICER_REVIEW_COLOR: u32 = 0x2ECC71;
 pub const LEGACY_PANEL_TITLE: &str = "⚔️ **XIII Legion** ⚔️ | Центр поддержки";
 pub const LEGACY_PANEL_DESCRIPTION: &str = "📩 **Заявка** — Хочу вступить в клан\n\n🚨 **Жалоба** — Подать жалобу на игрока\n\n📈 **Повышение** — Подать заявку на повышение";
+pub const APPLICATION_FORM_URL: &str = "https://forms.gle/jL7W5Y7b1rEnVdFk8";
+pub const TICKET_CREATED_TITLE: &str = "Тикет создан";
+pub const CLOSE_CONFIRM_TITLE: &str = "Подтверждение";
+pub const CLOSE_CONFIRM_DESCRIPTION: &str = "Вы уверены, что хотите закрыть тикет?";
+pub const CLOSE_CANCELLED_TEXT: &str = "Закрытие тикета отменено ✅";
+pub const DELETE_SUCCESS_TEXT: &str = "Тикет удаляется ✅";
+pub const REOPEN_SUCCESS_TEXT: &str = "Тикет переоткрыт ✅";
+pub const CLOSE_SUCCESS_TEXT: &str = "Тикет закрыт ✅";
+pub const STAFF_NOTES_MODAL_TITLE: &str = "Заметки персонала";
+pub const STAFF_NOTES_MODAL_LABEL: &str = "Заметка";
+pub const STAFF_NOTE_PREFIX: &str = "Заметка персонала:";
+pub const STAFF_NOTE_ADDED_TEXT: &str = "Заметка добавлена.";
+pub const STAFF_NOTE_DELETED_TEXT: &str = "Заметки удаляются ✅";
+pub const TRANSCRIPT_ATTACHED_TEXT: &str = "Транскрипт тикета приложен.";
+pub const TICKET_CLOSE_LABEL: &str = "🔒 Закрыть тикет";
+pub const TICKET_CLOSE_CONFIRM_LABEL: &str = "Да, закрыть";
+pub const TICKET_CLOSE_CANCEL_LABEL: &str = "Отмена";
+pub const TICKET_STAFF_NOTES_LABEL: &str = "📝 Заметки персонала";
+pub const TICKET_DELETE_LABEL: &str = "🗑️ Удалить тикет";
+pub const TICKET_REOPEN_LABEL: &str = "🔓 Переоткрыть тикет";
+pub const TICKET_NOTES_DELETE_LABEL: &str = "🗑 Удалить заметки";
+pub const APP_DECISION_ACCEPT_LABEL: &str = "✅ Принять";
+pub const APP_DECISION_REJECT_LABEL: &str = "❌ Отклонить";
+pub const CLOSE_RESULT_SENT_TITLE: &str = "Транскрипт отправлен";
+pub const CLOSE_RESULT_SENT_DESCRIPTION: &str =
+    "Копия тикета сохранена в канале транскриптов и отправлена пользователю в личные сообщения.";
+pub const CLOSE_RESULT_SAVED_TITLE: &str = "Транскрипт сохранён";
+pub const CLOSE_RESULT_SAVED_DESCRIPTION: &str =
+    "Копия тикета сохранена в канале транскриптов, но не удалось отправить её пользователю в личные сообщения.";
+pub const CLOSE_RESULT_FAILED_TITLE: &str = "Тикет закрыт";
+pub const CLOSE_RESULT_FAILED_DESCRIPTION: &str =
+    "Не удалось сохранить транскрипт. Проверьте логи приложения.";
+pub const CLOSE_CANCELLED_TITLE: &str = "Закрытие тикета отменено";
+pub const CLOSE_CANCELLED_DESCRIPTION: &str = "Тикет останется открытым.";
+pub const TRANSCRIPT_SUMMARY_TITLE: &str = "Тикет закрыт";
+pub const TRANSCRIPT_FIELD_TICKET: &str = "Тикет";
+pub const TRANSCRIPT_FIELD_NUMBER: &str = "Номер";
+pub const TRANSCRIPT_FIELD_TYPE: &str = "Тип";
+pub const TRANSCRIPT_FIELD_OPENED_BY: &str = "Открыл";
+pub const TRANSCRIPT_FIELD_CLOSED_BY: &str = "Закрыл";
+pub const TRANSCRIPT_FIELD_PARTICIPANTS: &str = "Участников";
+pub const TRANSCRIPT_FIELD_OPENED_AT: &str = "Открыт";
+pub const TRANSCRIPT_FIELD_CLOSED_AT: &str = "Закрыт";
+pub const UNKNOWN_VALUE: &str = "Не удалось определить";
+pub const LEGACY_CLOSE_SUCCESS_COLOR: u32 = 0x2ECC71;
+pub const LEGACY_CLOSE_WARNING_COLOR: u32 = 0xE67E22;
+pub const LEGACY_CLOSE_FAILURE_COLOR: u32 = 0x607D8B;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptMessage {
@@ -13,12 +64,219 @@ pub struct TranscriptMessage {
     pub attachment_urls: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderField {
+    pub name: String,
+    pub value: String,
+    pub inline: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketEmbedDraft {
+    pub title: String,
+    pub description: Option<String>,
+    pub fields: Vec<RenderField>,
+    pub color: u32,
+    pub footer: Option<String>,
+}
+
 pub fn panel_title() -> &'static str {
     LEGACY_PANEL_TITLE
 }
 
 pub fn panel_description() -> &'static str {
     LEGACY_PANEL_DESCRIPTION
+}
+
+pub fn close_confirmation_embed() -> TicketEmbedDraft {
+    TicketEmbedDraft {
+        title: CLOSE_CONFIRM_TITLE.to_owned(),
+        description: Some(CLOSE_CONFIRM_DESCRIPTION.to_owned()),
+        fields: Vec::new(),
+        color: LEGACY_COMPLAINT_COLOR,
+        footer: None,
+    }
+}
+
+pub fn close_cancelled_embed() -> TicketEmbedDraft {
+    TicketEmbedDraft {
+        title: CLOSE_CANCELLED_TITLE.to_owned(),
+        description: Some(CLOSE_CANCELLED_DESCRIPTION.to_owned()),
+        fields: Vec::new(),
+        color: LEGACY_CLOSE_SUCCESS_COLOR,
+        footer: None,
+    }
+}
+
+pub fn close_result_embed(transcript_saved: bool, dm_sent: bool) -> TicketEmbedDraft {
+    let (title, description, color) = if transcript_saved && dm_sent {
+        (
+            CLOSE_RESULT_SENT_TITLE,
+            CLOSE_RESULT_SENT_DESCRIPTION,
+            LEGACY_CLOSE_SUCCESS_COLOR,
+        )
+    } else if transcript_saved {
+        (
+            CLOSE_RESULT_SAVED_TITLE,
+            CLOSE_RESULT_SAVED_DESCRIPTION,
+            LEGACY_CLOSE_WARNING_COLOR,
+        )
+    } else {
+        (
+            CLOSE_RESULT_FAILED_TITLE,
+            CLOSE_RESULT_FAILED_DESCRIPTION,
+            LEGACY_CLOSE_FAILURE_COLOR,
+        )
+    };
+    TicketEmbedDraft {
+        title: title.to_owned(),
+        description: Some(description.to_owned()),
+        fields: Vec::new(),
+        color,
+        footer: None,
+    }
+}
+
+pub fn application_form_message(opener_mention: &str) -> String {
+    format!(
+        "## Приветствую, {opener_mention}!\n### Чтобы вступить, заполни короткую анкету по ссылке:\n### {}",
+        APPLICATION_FORM_URL
+    )
+}
+
+pub fn promotion_request_message(opener_mention: &str, ping_role_mention: &str) -> String {
+    format!(
+        "## Здравствуйте, {opener_mention}!\n### На какую должность вы претендуете?\n### Опишите почему вы достойный кандидат.\n### {ping_role_mention} займется вашей заявкой."
+    )
+}
+
+pub fn complaint_main_message(opener_mention: &str, ping_role_mention: &str) -> String {
+    format!("{opener_mention} Жалоба принята. {ping_role_mention} рассмотрят её в ближайшее время.")
+}
+
+pub fn complaint_embed_description() -> &'static str {
+    "🚨 **Жалоба на игрока**\nПожалуйста, укажите:\n• Ник/ID игрока\n• Что произошло (по фактам)\n• Время/сервер/место (если важно)\n• Скрины/видео (если есть)\n"
+}
+
+pub fn custom_ticket_description() -> &'static str {
+    "Используйте этот канал для обсуждения темы тикета."
+}
+
+pub fn accept_application_channel_text() -> &'static str {
+    "### Вы приняты на испытательный срок, он продлится 2 недели.\n### По окончании испытательного срока <@&1498057076151422976> примет решение о окончательном принятии в клан."
+}
+
+pub fn reject_application_channel_text() -> &'static str {
+    "### К сожалению вы не прошли собеседование, мы не можем принять вас.\n### Если не осталось вопросов закройте тикет.\n### С уважением XIII Legion."
+}
+
+pub fn close_dm_content(ticket_name: &str) -> String {
+    format!("📩 Ваш тикет `{ticket_name}` был закрыт!\nСпасибо за обращение 💙")
+}
+
+pub fn reopen_dm_content(ticket_name: &str) -> String {
+    format!("Ваш тикет `{ticket_name}` был переоткрыт.")
+}
+
+pub fn reopen_channel_message(actor_id: u64) -> String {
+    format!("🔄 Тикет переоткрыт модератором <@{actor_id}>.")
+}
+
+pub fn transcript_summary_embed(
+    ticket: &TicketRecord,
+    closer_id: u64,
+    closed_at: DateTime<Utc>,
+    participant_count: Option<usize>,
+) -> TicketEmbedDraft {
+    TicketEmbedDraft {
+        title: TRANSCRIPT_SUMMARY_TITLE.to_owned(),
+        description: None,
+        fields: vec![
+            RenderField {
+                name: TRANSCRIPT_FIELD_TICKET.to_owned(),
+                value: ticket
+                    .ticket_name
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| UNKNOWN_VALUE.to_owned()),
+                inline: true,
+            },
+            RenderField {
+                name: TRANSCRIPT_FIELD_NUMBER.to_owned(),
+                value: ticket_number_text(ticket),
+                inline: true,
+            },
+            RenderField {
+                name: TRANSCRIPT_FIELD_TYPE.to_owned(),
+                value: ticket_type_label(ticket.ticket_type).to_owned(),
+                inline: true,
+            },
+            RenderField {
+                name: TRANSCRIPT_FIELD_OPENED_BY.to_owned(),
+                value: format!("<@{}>", ticket.opener_id),
+                inline: true,
+            },
+            RenderField {
+                name: TRANSCRIPT_FIELD_CLOSED_BY.to_owned(),
+                value: format!("<@{closer_id}>"),
+                inline: true,
+            },
+            RenderField {
+                name: TRANSCRIPT_FIELD_PARTICIPANTS.to_owned(),
+                value: participant_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| UNKNOWN_VALUE.to_owned()),
+                inline: true,
+            },
+            RenderField {
+                name: TRANSCRIPT_FIELD_OPENED_AT.to_owned(),
+                value: format_legacy_datetime(Some(ticket.created_at_utc.as_str())),
+                inline: false,
+            },
+            RenderField {
+                name: TRANSCRIPT_FIELD_CLOSED_AT.to_owned(),
+                value: closed_at.format("%d.%m.%Y %H:%M:%S UTC").to_string(),
+                inline: false,
+            },
+        ],
+        color: LEGACY_CLOSE_FAILURE_COLOR,
+        footer: None,
+    }
+}
+
+pub fn officer_review_description(values: &[String], ticket_number: Option<i64>) -> String {
+    fn value(values: &[String], index: usize) -> &str {
+        values
+            .get(index)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("—")
+    }
+
+    let score_raw = value(values, 2);
+    let score_value = score_raw.replace(',', ".");
+    let score = score_value.parse::<f64>().ok().unwrap_or(0.0);
+    let result_text = if score >= 7.0 {
+        "✅ Тест пройден"
+    } else {
+        "❌ Тест не пройден"
+    };
+
+    format!(
+        "🧾 Заявка XIII Legion\n\n📊 Номер тикета\n{}\n\n👤 Имя Steam\n{}\n\n🎮 Steam ID\n{}\n\n📊 Баллы\n{} из 10\n\n🏠 Бывший клан\n{}\n\n⏱️ Время в Squad\n{}\n\n🤝 Готовы ли вы поддерживать дружеские отношения между соклановцами?\n{}\n\n🫃🏻 Сколько вам лет?\n{}\n\n💑 Как вы узнали о нашем клане?\n{}\n\n📌 Результат\n{}\n\nПеред принятием решения проведите собеседование с игроком.",
+        ticket_number
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "—".to_owned()),
+        value(values, 3),
+        value(values, 4),
+        score_raw,
+        value(values, 16),
+        value(values, 17),
+        value(values, 18),
+        value(values, 22),
+        value(values, 21),
+        result_text
+    )
 }
 
 pub fn transcript_text(ticket: &Ticket, messages: &[String]) -> String {
@@ -58,7 +316,7 @@ pub fn member_history(ticket_rows: &[TicketRecord]) -> String {
 pub fn close_result_text(ticket: &TicketRecord) -> String {
     match ticket.status {
         TicketStatus::Closed => format!(
-            "Ticket {} is closed. Reopen is available until {}.",
+            "Тикет {} закрыт. Переоткрытие доступно до {}.",
             ticket
                 .ticket_name
                 .clone()
@@ -66,9 +324,9 @@ pub fn close_result_text(ticket: &TicketRecord) -> String {
             ticket
                 .reopen_until_utc
                 .as_deref()
-                .unwrap_or("the configured cutoff")
+                .unwrap_or("настроенного срока")
         ),
-        _ => "Ticket close did not change state.".to_owned(),
+        _ => "Состояние тикета не изменилось.".to_owned(),
     }
 }
 
@@ -135,6 +393,36 @@ pub fn transcript_html(ticket: &TicketRecord, messages: &[TranscriptMessage]) ->
     }
     html.push_str("</body></html>");
     html
+}
+
+fn ticket_type_label(ticket_type: TicketType) -> &'static str {
+    match ticket_type {
+        TicketType::Application => "Заявка на вступление",
+        TicketType::Complaint => "Жалоба на игрока",
+        TicketType::Idea => "Заявка на повышение",
+        TicketType::Custom => "Пользовательский тикет",
+    }
+}
+
+fn ticket_number_text(ticket: &TicketRecord) -> String {
+    ticket
+        .ticket_name
+        .as_deref()
+        .and_then(|name| name.rsplit('-').next())
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| UNKNOWN_VALUE.to_owned())
+}
+
+fn format_legacy_datetime(value: Option<&str>) -> String {
+    value
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|time| {
+            time.with_timezone(&Utc)
+                .format("%d.%m.%Y %H:%M:%S UTC")
+                .to_string()
+        })
+        .unwrap_or_else(|| UNKNOWN_VALUE.to_owned())
 }
 
 pub fn sanitize_mentions(content: &str) -> String {

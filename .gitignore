@@ -9,9 +9,19 @@
 *.env
 *.env.*
 
-# Local generated runtime state
+# Local runtime state is environment-specific.
+# Keep only the placeholder so the directory exists in fresh clones.
 data/*
 !data/.gitkeep
+
+# Root-level command output artifacts from local preview/check commands
+/clanlist-render-preview.json
+/clanlist-render-preview.txt
+/clanlist-target-message-check.json
+/clanlist-write-plan.json
+/clanlist-snapshot.json
+/clanlist-bootstrap-result.json
+/clanlist-update-result.json
 
 # Local health / preview / audit outputs
 *.log
