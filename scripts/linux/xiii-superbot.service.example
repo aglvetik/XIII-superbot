@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/XIII/xiii-superbot
-ExecStart=/opt/XIII/xiii-superbot/xiii-superbot run-superbot --env-file /opt/XIII/xiii-superbot/.env --allow-discord-read --allow-discord-write --confirm-run-superbot --modules clanlist --health-output /opt/XIII/xiii-superbot/data/superbot_health.json --require-old-services-stopped --old-services-dir /opt/XIII/xiii-superbot/data/service-status
+ExecStart=/opt/XIII/xiii-superbot/xiii-superbot run-superbot --env-file /opt/XIII/xiii-superbot/.env.production --allow-discord-read --allow-discord-write --confirm-run-superbot --modules clanlist,temp_voice,vacation,discipline,recruit,voice_activity,tickets --health-output /opt/XIII/xiii-superbot/data/superbot_health.json --require-old-services-stopped --old-services-dir /opt/XIII/xiii-superbot/data/service-status
 Restart=always
 RestartSec=15
 User=xiii

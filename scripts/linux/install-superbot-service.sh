@@ -19,5 +19,6 @@ echo "Reloading systemd daemon..."
 systemctl daemon-reload
 
 echo "Installed ${SERVICE_NAME}."
-echo "Before starting it, place .env and state files under ${APP_DIR}, stop old services, and capture service status files."
+echo "Before starting it, place .env.production and state files under ${APP_DIR}, refresh the latest legacy DBs into their configured /opt paths, stop old services, and capture service status files."
+echo "Recommended read-only check first: ${APP_DIR}/xiii-superbot production-preflight --env-file ${APP_DIR}/.env.production"
 echo "Start only after dry-run verification: systemctl enable --now ${SERVICE_NAME}"

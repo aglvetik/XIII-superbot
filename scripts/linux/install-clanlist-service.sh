@@ -20,7 +20,7 @@ systemctl daemon-reload
 
 echo "Installed ${SERVICE_NAME}."
 echo "Before starting it, ensure:"
-echo "  1. ${APP_DIR}/.env exists and contains the production unified env."
+echo "  1. ${APP_DIR}/.env.production exists and contains the production unified env."
 echo "  2. ${APP_DIR}/data/clanlist_panel_state.json exists."
 echo "  3. The old xiii-clanlist service is stopped."
 echo "Then run: systemctl enable --now ${SERVICE_NAME}"

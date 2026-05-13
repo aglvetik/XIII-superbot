@@ -318,6 +318,13 @@ enum Commands {
         #[arg(long)]
         allow_discord_read: bool,
     },
+    /// Read-only production preflight for a private VPS env file.
+    ProductionPreflight {
+        #[arg(long)]
+        env_file: PathBuf,
+        #[arg(long)]
+        allow_discord_read: bool,
+    },
     /// Read-only report proving every module is using the configured legacy DB/state source.
     DbSourceCheck {
         #[arg(long)]
@@ -640,6 +647,10 @@ pub fn run() -> ExitCode {
             env_file,
             allow_discord_read,
         } => run_async!(final_readiness_check(env_file, allow_discord_read)),
+        Commands::ProductionPreflight {
+            env_file,
+            allow_discord_read,
+        } => run_async!(production_preflight(env_file, allow_discord_read)),
         Commands::DbSourceCheck { env_file } => run_async!(db_source_check(env_file)),
         Commands::LegacyParityAudit { env_file } => legacy_parity_audit(env_file),
         Commands::RenderPreview {
@@ -8695,7 +8706,10 @@ async fn voice_cutover_check(env_file: PathBuf, allow_discord_read: bool) -> Exi
     };
     println!("[OK] no database mutations were performed");
     if active_count > 0 {
-        println!("[FAIL] active DB voice sessions still exist; run `cargo run -- voice-finalize-cutover --env-file .env.local --allow-legacy-db-write --confirm-close-active-voice-sessions` during cutover to intentionally close them once");
+        println!(
+            "[FAIL] active DB voice sessions still exist; run `cargo run -- voice-finalize-cutover --env-file {} --allow-legacy-db-write --confirm-close-active-voice-sessions` during cutover to intentionally close them once",
+            env_file.display()
+        );
         ExitCode::from(2)
     } else if live_count > 0 && cutover_state.is_none() {
         println!("[FAIL] live Discord voice sessions exist and no finalized cutover state was found; either wait for voice to empty or intentionally split sessions with `voice-finalize-cutover`");
@@ -8992,7 +9006,7 @@ async fn final_readiness_check(env_file: PathBuf, allow_discord_read: bool) -> E
     .await;
 
     add_ticket_final_readiness(&mut report, &load.config).await;
-    add_voice_final_readiness(&mut report, &load.config, &state_dir).await;
+    add_voice_final_readiness(&mut report, &load.config, &state_dir, &env_file).await;
 
     report.warn(
         "tickets",
@@ -9009,6 +9023,295 @@ async fn final_readiness_check(env_file: PathBuf, allow_discord_read: bool) -> E
     }
 
     print_report("Final Readiness", &report);
+    if report.has_failures() {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+async fn production_preflight(env_file: PathBuf, allow_discord_read: bool) -> ExitCode {
+    let load = match SuperbotConfig::load_from_env_file(&env_file) {
+        Ok(load) => load,
+        Err(err) => {
+            println!("[FAIL] config {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let state_dir = superbot_state_dir_from_env(&env_file);
+    let mut report = Report::new();
+
+    println!("XIII Superbot Production Preflight");
+    println!("Mode: READ ONLY / NO WRITES");
+    println!("Env file: {}", env_file.display());
+    println!(
+        "Discord reads: {}",
+        if allow_discord_read {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        }
+    );
+    println!("Discord writes: DISABLED");
+    println!("Legacy DB writes: DISABLED");
+    println!("Google calls: DISABLED");
+    println!();
+
+    match env_file.file_name().and_then(|name| name.to_str()) {
+        Some(".env.production") => report.ok("config", "env file name looks production-shaped"),
+        Some(".env.example") => report.warn(
+            "config",
+            "env file is the tracked example template; replace placeholders and real VPS paths before deployment",
+        ),
+        Some(name) => report.warn(
+            "config",
+            format!("env file name is {name}; expected a private production file such as .env.production"),
+        ),
+        None => report.warn(
+            "config",
+            "env file name could not be derived; verify this is the intended private production env",
+        ),
+    }
+
+    if superbot_require_old_services_stopped_from_env(&env_file) {
+        report.ok(
+            "service_guard",
+            "SUPERBOT_REQUIRE_OLD_SERVICES_STOPPED=true",
+        );
+    } else {
+        report.fail(
+            "service_guard",
+            "SUPERBOT_REQUIRE_OLD_SERVICES_STOPPED must stay true for production",
+        );
+    }
+
+    if read_env_value(&env_file, "DISCORD_SYNC_COMMANDS_ON_STARTUP")
+        .map(|value| parse_truthy_bool(&value))
+        .unwrap_or(false)
+    {
+        report.fail(
+            "discord",
+            "DISCORD_SYNC_COMMANDS_ON_STARTUP must stay false; production command sync should remain explicit",
+        );
+    } else {
+        report.ok(
+            "discord",
+            "DISCORD_SYNC_COMMANDS_ON_STARTUP=false (explicit sync only)",
+        );
+    }
+
+    add_production_path_report(&mut report, "state", "SUPERBOT_STATE_DIR", &state_dir);
+    if let Some(health_output) =
+        read_env_value(&env_file, "SUPERBOT_HEALTH_OUTPUT").filter(|value| !value.trim().is_empty())
+    {
+        add_production_path_report(
+            &mut report,
+            "state",
+            "SUPERBOT_HEALTH_OUTPUT",
+            Path::new(&health_output),
+        );
+    }
+
+    let service_status_dir = state_dir.join("service-status");
+    add_production_path_report(
+        &mut report,
+        "service_guard",
+        "service-status directory",
+        &service_status_dir,
+    );
+    let missing_service_files = SuperbotModuleKind::all()
+        .into_iter()
+        .filter_map(|module| {
+            let path = service_status_dir.join(format!("{}.txt", module.spec().service_name));
+            (!path.is_file()).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    if missing_service_files.is_empty() {
+        report.ok(
+            "service_guard",
+            format!(
+                "service-status directory contains all {} expected old-service snapshots",
+                SuperbotModuleKind::all().len()
+            ),
+        );
+    } else {
+        report.warn(
+            "service_guard",
+            format!(
+                "capture old-service status files before final enablement; missing {} entries under {}",
+                missing_service_files.len(),
+                service_status_dir.display()
+            ),
+        );
+    }
+
+    for module in SuperbotModuleKind::all() {
+        if module.readiness() == ModuleReadiness::ReadyFull {
+            report.ok(module.name(), "readiness=READY_FULL");
+        } else {
+            report.fail(
+                module.name(),
+                format!(
+                    "readiness={} blocks production enablement",
+                    module.readiness().as_str()
+                ),
+            );
+        }
+    }
+
+    add_production_path_report(
+        &mut report,
+        "clanlist",
+        "LEGACY_CLANLIST_DATA_DIR",
+        &load.config.legacy_paths.clanlist_data_dir.resolved,
+    );
+    add_production_path_report(
+        &mut report,
+        "temp_voice",
+        "LEGACY_TEMP_VOICE_DB_PATH",
+        &load.config.legacy_paths.temp_voice_db.resolved,
+    );
+    add_production_path_report(
+        &mut report,
+        "vacation",
+        "LEGACY_VACATION_DB_PATH",
+        &load.config.legacy_paths.vacation_db.resolved,
+    );
+    add_production_path_report(
+        &mut report,
+        "discipline",
+        "LEGACY_DISCIPLINE_DB_PATH",
+        &load.config.legacy_paths.discipline_db.resolved,
+    );
+    add_production_path_report(
+        &mut report,
+        "recruit",
+        "LEGACY_RECRUIT_DB_PATH",
+        &load.config.legacy_paths.recruit_db.resolved,
+    );
+    add_production_path_report(
+        &mut report,
+        "voice_activity",
+        "LEGACY_VOICE_DB_PATH",
+        &load.config.legacy_paths.voice_db.resolved,
+    );
+    add_production_path_report(
+        &mut report,
+        "tickets",
+        "LEGACY_TICKET_DB_PATH",
+        &load.config.legacy_paths.ticket_db.resolved,
+    );
+
+    let state_expectations = [
+        ("clanlist", "clanlist_panel_state.json", 3usize),
+        ("vacation", "vacation_panel_state.json", 2usize),
+        ("discipline", "discipline_panel_state.json", 1usize),
+        ("voice_activity", "voice_activity_panel_state.json", 1usize),
+        ("tickets", "ticket_panel_state.json", 1usize),
+    ];
+    for (scope, file, min_targets) in state_expectations {
+        let path = state_dir.join(file);
+        match validate_fresh_state_json(&path, load.config.core.guild_id, min_targets) {
+            Ok(targets) => report.ok(
+                scope,
+                format!(
+                    "fresh state {} guild_id matches; message targets={}",
+                    path.display(),
+                    targets.len()
+                ),
+            ),
+            Err(err) => report.fail(scope, err),
+        }
+    }
+
+    add_db_source_report(
+        &mut report,
+        "clanlist",
+        &load.config.legacy_paths.clanlist_data_dir.resolved,
+        &[],
+    )
+    .await;
+    add_db_source_report(
+        &mut report,
+        "temp_voice",
+        &load.config.legacy_paths.temp_voice_db.resolved,
+        &[("guild_settings", true), ("temp_voice_channels", true)],
+    )
+    .await;
+    add_db_source_report(
+        &mut report,
+        "vacation",
+        &load.config.legacy_paths.vacation_db.resolved,
+        &[("vacation_requests", true), ("vacations", true)],
+    )
+    .await;
+    add_db_source_report(
+        &mut report,
+        "discipline",
+        &load.config.legacy_paths.discipline_db.resolved,
+        &[
+            ("settings", true),
+            ("punishments", true),
+            ("action_logs", true),
+            ("action_locks", false),
+        ],
+    )
+    .await;
+    add_db_source_report(
+        &mut report,
+        "recruit",
+        &load.config.legacy_paths.recruit_db.resolved,
+        &[
+            ("recruits", true),
+            ("voice_sessions", true),
+            ("decisions", true),
+        ],
+    )
+    .await;
+    add_db_source_report(
+        &mut report,
+        "voice_activity",
+        &load.config.legacy_paths.voice_db.resolved,
+        &[
+            ("users", true),
+            ("voice_sessions", true),
+            ("active_voice_sessions", true),
+            ("bot_state", true),
+        ],
+    )
+    .await;
+    add_db_source_report(
+        &mut report,
+        "tickets",
+        &load.config.legacy_paths.ticket_db.resolved,
+        &[
+            ("counters", true),
+            ("tickets", true),
+            ("processed_forms", true),
+            ("processed_form_signatures", true),
+            ("bot_state", true),
+        ],
+    )
+    .await;
+
+    add_ticket_final_readiness(&mut report, &load.config).await;
+    add_voice_final_readiness(&mut report, &load.config, &state_dir, &env_file).await;
+
+    report.warn(
+        "tickets",
+        "operator check required: MESSAGE_CONTENT intent must be enabled before ticket cutover for !panel, !accept/!принять, and !reject/!отклонить",
+    );
+
+    if allow_discord_read {
+        add_discord_panel_ownership_checks(&mut report, &env_file, &load.config, &state_dir).await;
+    } else {
+        report.warn(
+            "discord",
+            "fresh panel message existence/ownership was not checked; pass --allow-discord-read for optional HTTP GET verification",
+        );
+    }
+
+    print_report("Production Preflight", &report);
     if report.has_failures() {
         ExitCode::from(2)
     } else {
@@ -11774,6 +12077,27 @@ async fn add_db_source_report(
     }
 }
 
+fn add_production_path_report(report: &mut Report, scope: &str, label: &str, path: &Path) {
+    report.ok(scope, format!("{label} = {}", path.display()));
+    match production_path_issue(path) {
+        Some(issue) => report.fail(scope, format!("{label} {issue}")),
+        None => report.ok(scope, format!("{label} looks production-shaped")),
+    }
+}
+
+fn production_path_issue(path: &Path) -> Option<&'static str> {
+    let normalized = normalized_path_string(path);
+    if normalized.contains("xiii_bots_full_copy") {
+        Some("points at XIII_BOTS_FULL_COPY; replace it with the real VPS legacy path before production")
+    } else if normalized.contains(":\\") {
+        Some("looks like a Windows path; production env files must use Linux VPS paths")
+    } else if !normalized.starts_with('\\') {
+        Some("is relative; production env files should use explicit VPS paths")
+    } else {
+        None
+    }
+}
+
 async fn open_sqlite_read_only_pool(path: &Path) -> Result<sqlx::SqlitePool, String> {
     let options = SqliteConnectOptions::new()
         .filename(path)
@@ -11938,7 +12262,12 @@ async fn add_ticket_final_readiness(report: &mut Report, config: &SuperbotConfig
     }
 }
 
-async fn add_voice_final_readiness(report: &mut Report, config: &SuperbotConfig, state_dir: &Path) {
+async fn add_voice_final_readiness(
+    report: &mut Report,
+    config: &SuperbotConfig,
+    state_dir: &Path,
+    env_file: &Path,
+) {
     let active_count =
         match read_voice_active_session_count(&config.legacy_paths.voice_db.resolved).await {
             Ok(count) => count,
@@ -11975,7 +12304,8 @@ async fn add_voice_final_readiness(report: &mut Report, config: &SuperbotConfig,
         report.fail(
             "voice_activity",
             format!(
-                "active_voice_sessions rows = {active_count}; intentionally close them with `cargo run -- voice-finalize-cutover --env-file .env.local --allow-legacy-db-write --confirm-close-active-voice-sessions`"
+                "active_voice_sessions rows = {active_count}; intentionally close them with `cargo run -- voice-finalize-cutover --env-file {} --allow-legacy-db-write --confirm-close-active-voice-sessions`",
+                env_file.display()
             ),
         );
     }
@@ -14326,13 +14656,13 @@ mod tests {
         clanlist_interval_seconds, collect_json_message_targets, discord_read_permission_failure,
         duration_between_iso_clamped, emit_output, legacy_parity_modules, module_manifests,
         module_render_preview, parse_old_service_status, parse_retry_after_from_body,
-        render_preview_json, resolve_health_output_path, resolve_state_file_path,
-        resolve_state_output_path, retry_delay_for_attempt, run_clanlist_permission_failure,
-        run_superbot_permission_failure, sync_command_plan, update_permission_failure,
-        valid_voice_cutover_state, validate_fresh_state_json, validate_output_path,
-        write_clanlist_health, write_plan_permission_failure, ClanlistRefreshOutcome,
-        LegacyParityStatus, ModuleReadiness, NonOverlapGuard, OldServiceStatus, SuperbotModuleKind,
-        SyncPlanStatus, TempVoiceOccupancy,
+        production_path_issue, render_preview_json, resolve_health_output_path,
+        resolve_state_file_path, resolve_state_output_path, retry_delay_for_attempt,
+        run_clanlist_permission_failure, run_superbot_permission_failure, sync_command_plan,
+        update_permission_failure, valid_voice_cutover_state, validate_fresh_state_json,
+        validate_output_path, write_clanlist_health, write_plan_permission_failure,
+        ClanlistRefreshOutcome, LegacyParityStatus, ModuleReadiness, NonOverlapGuard,
+        OldServiceStatus, SuperbotModuleKind, SyncPlanStatus, TempVoiceOccupancy,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -14491,6 +14821,35 @@ mod tests {
             duration_between_iso_clamped("2026-05-10T11:00:00Z", "2026-05-10T10:00:00Z"),
             0
         );
+    }
+
+    #[test]
+    fn production_path_issue_accepts_linux_style_vps_paths() {
+        assert_eq!(
+            production_path_issue(Path::new("/opt/XIII/xiii-superbot/data")),
+            None
+        );
+        assert_eq!(
+            production_path_issue(Path::new("/opt/XIII/xiii-vacation-bot/data/vacations.db")),
+            None
+        );
+    }
+
+    #[test]
+    fn production_path_issue_rejects_local_validation_and_windows_paths() {
+        assert!(production_path_issue(Path::new(
+            "../XIII_BOTS_FULL_COPY/opt/xiii-ticketbot/tickets.db"
+        ))
+        .unwrap()
+        .contains("XIII_BOTS_FULL_COPY"));
+        assert!(
+            production_path_issue(Path::new("D:/clients/XIII 2/xiii-superbot/data"))
+                .unwrap()
+                .contains("Windows path")
+        );
+        assert!(production_path_issue(Path::new("data"))
+            .unwrap()
+            .contains("relative"));
     }
 
     #[test]

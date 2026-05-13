@@ -2,7 +2,7 @@
 
 Date: 2026-05-13
 
-Deployment is still deferred. This runbook exists to keep the real cutover disciplined when we do it later.
+Deployment is still deferred. This runbook exists so the real cutover stays disciplined when we are ready.
 
 ## Operator Assumptions
 
@@ -10,6 +10,7 @@ Deployment is still deferred. This runbook exists to keep the real cutover disci
 - The Superbot must not start in real write mode until the matching old service is stopped.
 - Every write-capable command stays behind explicit confirm flags.
 - Local validation may use `../XIII_BOTS_FULL_COPY`, but production paths must be refreshed against the VPS before enablement.
+- `.env.example` is safe to track; the real deployment env should live in a private file such as `/opt/XIII/xiii-superbot/.env.production`.
 
 ## Current Runtime Status
 
@@ -49,6 +50,27 @@ cargo run -- db-source-check --env-file .env.local
 cargo run -- final-readiness-check --env-file .env.local
 ```
 
+## VPS Pre-Cutover Preparation (No Service Changes)
+
+This section is explicitly before stopping old bots. These steps are read-only or status-capture only.
+
+```bash
+chmod +x scripts/linux/*.sh
+bash -n scripts/linux/collect-vps-precutover-state.sh
+bash -n scripts/linux/verify-production-layout.sh
+./scripts/linux/verify-production-layout.sh --env-file /opt/XIII/xiii-superbot/.env.production
+./scripts/linux/collect-vps-precutover-state.sh --dry-run
+./scripts/linux/collect-vps-precutover-state.sh
+cargo run -- production-preflight --env-file /opt/XIII/xiii-superbot/.env.production
+```
+
+Notes:
+
+- `verify-production-layout.sh` only checks the VPS layout and the production path variables parsed from `.env.production`.
+- `collect-vps-precutover-state.sh` creates `/opt/XIII/xiii-superbot/data/service-status` if needed and captures `systemctl status`, `is-active`, and `is-enabled` outputs for the old services.
+- Neither script stops, starts, restarts, enables, or disables any service.
+- Neither script modifies any legacy DB.
+
 ## Write-Capable Commands
 
 Treat the following as production-changing commands:
@@ -86,6 +108,33 @@ systemctl status xiii-voice-activity-bot.service --no-pager > /opt/XIII/xiii-sup
 systemctl status xiii-ticketbot.service --no-pager > /opt/XIII/xiii-superbot/data/service-status/xiii-ticketbot.service.txt
 ```
 
+## Production Cutover Sequence
+
+When we are ready on the VPS, keep the sequence mechanical:
+
+1. Copy/update the repo under `/opt/XIII/xiii-superbot`.
+2. Create `/opt/XIII/xiii-superbot/.env.production` from `.env.example`.
+3. Replace every example `LEGACY_*` path with the current VPS legacy DB/state path.
+4. Copy or refresh the latest legacy DBs/state files from the old bot locations.
+5. Run the VPS pre-cutover preparation steps above.
+6. Run read-only checks:
+
+```bash
+cd /opt/XIII/xiii-superbot
+./xiii-superbot check-config --env-file /opt/XIII/xiii-superbot/.env.production
+./xiii-superbot db-source-check --env-file /opt/XIII/xiii-superbot/.env.production
+./xiii-superbot production-preflight --env-file /opt/XIII/xiii-superbot/.env.production --allow-discord-read
+```
+
+7. Bootstrap or verify fresh Superbot-owned panel state only where it is still missing.
+8. Stop the old services.
+9. Re-run `production-preflight` and any module-specific read-only checks that still matter.
+10. Resolve Voice Activity active sessions by waiting for zero active sessions or running `voice-finalize-cutover`.
+11. Enable the required `*_ENABLED=true` flags in `.env.production`.
+12. Install/start the Superbot service.
+13. Monitor logs and health files.
+14. If anything is wrong, stop the Superbot service, restore the backed-up legacy DB/state files, and restart the old services.
+
 ## Voice Activity Cutover Policy
 
 Voice Activity is the one module with a special cutover step:
@@ -93,7 +142,7 @@ Voice Activity is the one module with a special cutover step:
 1. Run the read-only check:
 
 ```bash
-./xiii-superbot voice-cutover-check --env-file .env --allow-discord-read
+./xiii-superbot voice-cutover-check --env-file .env.production --allow-discord-read
 ```
 
 2. If active legacy sessions are still open, decide during the cutover window whether to:
@@ -103,14 +152,14 @@ Voice Activity is the one module with a special cutover step:
 3. Preview the intentional close plan:
 
 ```bash
-./xiii-superbot voice-finalize-cutover --env-file .env --dry-run
+./xiii-superbot voice-finalize-cutover --env-file .env.production --dry-run
 ```
 
 4. Only during the real cutover window, after backups and old-service shutdown:
 
 ```bash
 ./xiii-superbot voice-finalize-cutover \
-  --env-file .env \
+  --env-file .env.production \
   --allow-legacy-db-write \
   --confirm-close-active-voice-sessions
 ```
@@ -128,7 +177,7 @@ Before enabling Tickets:
 2. Run:
 
 ```bash
-./xiii-superbot ticket-cutover-check --env-file .env
+./xiii-superbot ticket-cutover-check --env-file .env.production
 ```
 
 3. Ensure fresh ticket panel state exists.
@@ -138,9 +187,9 @@ The transcript implementation difference is accepted: the Superbot uses a safe R
 
 ## Local Pre-Deploy Validation
 
-```powershell
-cd "D:\clients\XIII 2\xiii-superbot"
+Run from the repository root:
 
+```powershell
 cargo fmt --check
 cargo check
 cargo test --workspace

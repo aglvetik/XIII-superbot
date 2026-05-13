@@ -45,6 +45,7 @@ Legacy source under `../XIII_BOTS_FULL_COPY` remains the visual/text source of t
 | `module-status` | Ready | No writes |
 | `verify-cutover` | Ready | No writes |
 | `db-source-check` | Ready | No writes |
+| `production-preflight` | Ready | No writes by default; optional Discord read checks with `--allow-discord-read` |
 | `final-readiness-check` | Ready | No writes by default; optional Discord read checks with `--allow-discord-read` |
 | `legacy-parity-audit` | Ready | No writes |
 | `render-preview` | Ready | No writes; can emit UTF-8 text/JSON reports |
@@ -63,9 +64,10 @@ There are no remaining code-readiness blockers. The remaining blockers are opera
 1. Refresh/verify real VPS `LEGACY_*` paths before production use.
 2. Stop all old per-module services before enabling the Superbot writers.
 3. Bootstrap fresh panel state on the real guild where needed.
-4. Confirm Message Content intent before ticket cutover.
-5. Resolve active Voice Activity sessions by waiting for zero active sessions or running `voice-finalize-cutover` during the cutover window.
-6. Keep all secrets in local env files only; do not commit them.
+4. Run `production-preflight --env-file /opt/XIII/xiii-superbot/.env.production` after copying the real DBs/state files into place.
+5. Confirm Message Content intent before ticket cutover.
+6. Resolve active Voice Activity sessions by waiting for zero active sessions or running `voice-finalize-cutover` during the cutover window.
+7. Keep all secrets in local env files only; do not commit them.
 
 ## Recommended Local Validation
 

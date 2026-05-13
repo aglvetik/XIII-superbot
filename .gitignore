@@ -4,12 +4,18 @@
 
 # Local env / secrets
 .env
+.env.local
+.env.local.*
 .env.*
 *.env
 *.env.*
+!.env.example
 
 # Local runtime state is environment-specific.
 # Keep only the placeholder so the directory exists in fresh clones.
+data/*.json
+data/*.txt
+data/*health*.json
 data/*
 !data/.gitkeep
 
