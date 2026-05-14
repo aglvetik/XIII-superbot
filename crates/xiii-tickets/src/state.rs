@@ -115,6 +115,15 @@ impl TicketRecord {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketRuntimeState {
+    pub ticket_id: i64,
+    pub transcript_channel_message_id: Option<u64>,
+    pub transcript_dm_message_id: Option<u64>,
+    pub closed_controls_message_id: Option<u64>,
+    pub last_transcript_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketPanelState {
     pub source: String,

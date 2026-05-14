@@ -35,8 +35,10 @@ use crate::runtime::{
     next_ticket_number, open_tickets_for_user, ping_role_for_ticket_type, ticket_channel_name,
     GooglePollAction, TicketLifecycleAction, ACCEPT_NICKNAME_PREFIX,
 };
-use crate::state::{GoogleFormRow, Ticket, TicketStatus, TicketType};
+use crate::state::{GoogleFormRow, Ticket, TicketRuntimeState, TicketStatus, TicketType};
 use chrono::{TimeZone, Utc};
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -762,6 +764,100 @@ async fn bot_state_claim_prevents_duplicate_application_decisions() {
         .try_claim_bot_state("ticket_application_decision:9001", "accepted")
         .await
         .unwrap());
+    cleanup_dir(dir);
+}
+
+#[tokio::test]
+async fn ticket_runtime_state_persists_transcript_and_closed_controls_ids() {
+    let (dir, db) = test_db_path("ticket_runtime_state");
+    let repo = LegacySqliteTicketRepository::open_writable_for_tests(&db)
+        .await
+        .unwrap();
+    repo.create_schema_for_tests().await.unwrap();
+
+    let state = TicketRuntimeState {
+        ticket_id: 77,
+        transcript_channel_message_id: Some(111),
+        transcript_dm_message_id: Some(222),
+        closed_controls_message_id: Some(333),
+        last_transcript_hash: Some("hash-1".to_owned()),
+    };
+    repo.upsert_ticket_runtime_state(&state).await.unwrap();
+
+    let loaded = repo.ticket_runtime_state(77).await.unwrap();
+    assert_eq!(loaded, state);
+
+    let updated = TicketRuntimeState {
+        last_transcript_hash: Some("hash-2".to_owned()),
+        ..loaded
+    };
+    repo.upsert_ticket_runtime_state(&updated).await.unwrap();
+    assert_eq!(repo.ticket_runtime_state(77).await.unwrap(), updated);
+    cleanup_dir(dir);
+}
+
+#[tokio::test]
+async fn ticket_runtime_state_schema_migration_is_idempotent_for_old_db_layout() {
+    let (dir, db) = test_db_path("ticket_runtime_state_migration");
+    let options = SqliteConnectOptions::new()
+        .filename(&db)
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    for query in [
+        "CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS tickets (
+            ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_name TEXT,
+            opener_id INTEGER NOT NULL,
+            ticket_type TEXT NOT NULL,
+            channel_id INTEGER,
+            status TEXT NOT NULL,
+            created_at_ts REAL NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            closed_at_utc TEXT,
+            reopen_until_utc TEXT
+        )",
+        "CREATE TABLE IF NOT EXISTS processed_forms (sheet_row INTEGER PRIMARY KEY, processed_at_utc TEXT)",
+        "CREATE TABLE IF NOT EXISTS processed_form_signatures (signature TEXT PRIMARY KEY, processed_at_utc TEXT)",
+        "CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    ] {
+        sqlx::query(query).execute(&pool).await.unwrap();
+    }
+    drop(pool);
+
+    let repo = LegacySqliteTicketRepository::open_existing_writable(&db)
+        .await
+        .unwrap();
+    let initial = repo.ticket_runtime_state(55).await.unwrap();
+    assert_eq!(
+        initial,
+        TicketRuntimeState {
+            ticket_id: 55,
+            ..TicketRuntimeState::default()
+        }
+    );
+    repo.upsert_ticket_runtime_state(&TicketRuntimeState {
+        ticket_id: 55,
+        transcript_channel_message_id: Some(444),
+        transcript_dm_message_id: None,
+        closed_controls_message_id: Some(555),
+        last_transcript_hash: Some("hash".to_owned()),
+    })
+    .await
+    .unwrap();
+    drop(repo);
+
+    let repo = LegacySqliteTicketRepository::open_existing_writable(&db)
+        .await
+        .unwrap();
+    let loaded = repo.ticket_runtime_state(55).await.unwrap();
+    assert_eq!(loaded.transcript_channel_message_id, Some(444));
+    assert_eq!(loaded.closed_controls_message_id, Some(555));
+    assert_eq!(loaded.last_transcript_hash.as_deref(), Some("hash"));
     cleanup_dir(dir);
 }
 

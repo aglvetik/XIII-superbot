@@ -23,7 +23,8 @@ use twilight_model::http::permission_overwrite::{
     PermissionOverwriteType as HttpPermissionOverwriteType,
 };
 use twilight_model::id::marker::{
-    ChannelMarker, GenericMarker, GuildMarker, MessageMarker, RoleMarker, UserMarker,
+    AttachmentMarker, ChannelMarker, GenericMarker, GuildMarker, MessageMarker, RoleMarker,
+    UserMarker,
 };
 use twilight_model::id::Id;
 
@@ -258,6 +259,33 @@ impl TicketDiscordHttp {
             .map_err(|err| format!("failed to decode ticket embed message: {err}"))
     }
 
+    pub async fn update_channel_embed_message(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        embed: &Embed,
+        components: Option<Vec<Component>>,
+    ) -> Result<DiscordMessage, String> {
+        let embeds = [embed.clone()];
+        let allowed = AllowedMentions::default();
+        let mut request = self
+            .client
+            .update_message(
+                Id::<ChannelMarker>::new(channel_id),
+                Id::<MessageMarker>::new(message_id),
+            )
+            .allowed_mentions(Some(&allowed))
+            .content(None)
+            .embeds(Some(&embeds));
+        request = request.components(components.as_deref());
+        request
+            .await
+            .map_err(|err| format!("failed to update ticket embed message {message_id}: {err}"))?
+            .model()
+            .await
+            .map_err(|err| format!("failed to decode updated ticket embed message: {err}"))
+    }
+
     pub async fn update_message_components(
         &self,
         channel_id: u64,
@@ -343,6 +371,75 @@ impl TicketDiscordHttp {
         Ok(Some(message.id.get()))
     }
 
+    pub async fn send_channel_transcript_message(
+        &self,
+        channel_id: u64,
+        embed: &Embed,
+        payload: &TicketTranscriptPayload,
+        components: Option<Vec<Component>>,
+    ) -> Result<DiscordMessage, String> {
+        let embeds = [embed.clone()];
+        let attachments = [Attachment::from_bytes(
+            payload.filename.clone(),
+            payload.body.clone().into_bytes(),
+            0,
+        )];
+        let allowed = AllowedMentions::default();
+        let mut request = self
+            .client
+            .create_message(Id::<ChannelMarker>::new(channel_id))
+            .allowed_mentions(Some(&allowed))
+            .embeds(&embeds)
+            .attachments(&attachments);
+        if let Some(components) = components.as_ref() {
+            request = request.components(components);
+        }
+        request
+            .await
+            .map_err(|err| format!("failed to send ticket transcript message: {err}"))?
+            .model()
+            .await
+            .map_err(|err| format!("failed to decode ticket transcript message: {err}"))
+    }
+
+    pub async fn update_channel_transcript_message(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        embed: &Embed,
+        payload: &TicketTranscriptPayload,
+        components: Option<Vec<Component>>,
+    ) -> Result<DiscordMessage, String> {
+        let embeds = [embed.clone()];
+        let attachments = [Attachment::from_bytes(
+            payload.filename.clone(),
+            payload.body.clone().into_bytes(),
+            0,
+        )];
+        let keep: [Id<AttachmentMarker>; 0] = [];
+        let allowed = AllowedMentions::default();
+        let mut request = self
+            .client
+            .update_message(
+                Id::<ChannelMarker>::new(channel_id),
+                Id::<MessageMarker>::new(message_id),
+            )
+            .allowed_mentions(Some(&allowed))
+            .content(None)
+            .embeds(Some(&embeds))
+            .attachments(&attachments)
+            .keep_attachment_ids(&keep);
+        request = request.components(components.as_deref());
+        request
+            .await
+            .map_err(|err| {
+                format!("failed to update ticket transcript message {message_id}: {err}")
+            })?
+            .model()
+            .await
+            .map_err(|err| format!("failed to decode updated ticket transcript message: {err}"))
+    }
+
     pub async fn send_dm_transcript(
         &self,
         user_id: u64,
@@ -365,6 +462,80 @@ impl TicketDiscordHttp {
             .model()
             .await
             .map_err(|err| format!("failed to decode ticket DM transcript message: {err}"))?;
+        Ok(Some(message.id.get()))
+    }
+
+    pub async fn send_dm_transcript_message(
+        &self,
+        user_id: u64,
+        embed: &Embed,
+        payload: &TicketTranscriptPayload,
+        components: Option<Vec<Component>>,
+    ) -> Result<Option<u64>, String> {
+        let channel_id = self.open_dm_channel(user_id).await?;
+        let embeds = [embed.clone()];
+        let attachments = [Attachment::from_bytes(
+            payload.filename.clone(),
+            payload.body.clone().into_bytes(),
+            0,
+        )];
+        let allowed = AllowedMentions::default();
+        let mut request = self
+            .client
+            .create_message(channel_id)
+            .allowed_mentions(Some(&allowed))
+            .embeds(&embeds)
+            .attachments(&attachments);
+        if let Some(components) = components.as_ref() {
+            request = request.components(components);
+        }
+        let message = request
+            .await
+            .map_err(|err| {
+                format!("failed to send ticket DM transcript message to {user_id}: {err}")
+            })?
+            .model()
+            .await
+            .map_err(|err| format!("failed to decode ticket DM transcript message: {err}"))?;
+        Ok(Some(message.id.get()))
+    }
+
+    pub async fn update_dm_transcript_message(
+        &self,
+        user_id: u64,
+        message_id: u64,
+        embed: &Embed,
+        payload: &TicketTranscriptPayload,
+        components: Option<Vec<Component>>,
+    ) -> Result<Option<u64>, String> {
+        let channel_id = self.open_dm_channel(user_id).await?;
+        let embeds = [embed.clone()];
+        let attachments = [Attachment::from_bytes(
+            payload.filename.clone(),
+            payload.body.clone().into_bytes(),
+            0,
+        )];
+        let keep: [Id<AttachmentMarker>; 0] = [];
+        let allowed = AllowedMentions::default();
+        let mut request = self
+            .client
+            .update_message(channel_id, Id::<MessageMarker>::new(message_id))
+            .allowed_mentions(Some(&allowed))
+            .content(None)
+            .embeds(Some(&embeds))
+            .attachments(&attachments)
+            .keep_attachment_ids(&keep);
+        request = request.components(components.as_deref());
+        let message = request
+            .await
+            .map_err(|err| {
+                format!(
+                    "failed to update ticket DM transcript message {message_id} for {user_id}: {err}"
+                )
+            })?
+            .model()
+            .await
+            .map_err(|err| format!("failed to decode updated ticket DM transcript message: {err}"))?;
         Ok(Some(message.id.get()))
     }
 

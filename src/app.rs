@@ -4,6 +4,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Row;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -3626,6 +3627,53 @@ async fn respond_interaction_ephemeral_http(
         .await
     {
         println!("[WARN] failed to respond to interaction: {err}");
+    }
+}
+
+fn deferred_ephemeral_interaction_response(
+) -> twilight_model::http::interaction::InteractionResponse {
+    twilight_model::http::interaction::InteractionResponse {
+        kind:
+            twilight_model::http::interaction::InteractionResponseType::DeferredChannelMessageWithSource,
+        data: Some(twilight_model::http::interaction::InteractionResponseData {
+            flags: Some(twilight_model::channel::message::MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    }
+}
+
+async fn defer_interaction_ephemeral_http(client: &DiscordHttpClient, interaction: &Interaction) {
+    let response = deferred_ephemeral_interaction_response();
+    if let Err(err) = client
+        .interaction(Id::<ApplicationMarker>::new(
+            interaction.application_id.get(),
+        ))
+        .create_response(
+            Id::<twilight_model::id::marker::InteractionMarker>::new(interaction.id.get()),
+            interaction.token.as_str(),
+            &response,
+        )
+        .await
+    {
+        println!("[WARN] failed to defer interaction response: {err}");
+    }
+}
+
+async fn update_interaction_response_ephemeral_http(
+    client: &DiscordHttpClient,
+    interaction: &Interaction,
+    content: &str,
+) {
+    if let Err(err) = client
+        .interaction(Id::<ApplicationMarker>::new(
+            interaction.application_id.get(),
+        ))
+        .update_response(interaction.token.as_str())
+        .allowed_mentions(Some(&AllowedMentions::default()))
+        .content(Some(content))
+        .await
+    {
+        println!("[WARN] failed to update deferred interaction response: {err}");
     }
 }
 
@@ -10641,6 +10689,7 @@ async fn handle_ticket_component(
         return;
     };
     use xiii_tickets::interactions::TicketComponentRoute;
+    let defer_slow_action = ticket_component_requires_deferred_ack(route);
     match route {
         TicketComponentRoute::OpenApplication => {
             handle_ticket_create_from_interaction(
@@ -10681,21 +10730,19 @@ async fn handle_ticket_component(
             .await;
         }
         TicketComponentRoute::CloseConfirm => {
-            match ticket_close_current_channel(interaction, runtime).await {
-                Ok(embed) => {
-                    respond_interaction_update_embeds_http(
-                        runtime.http.as_ref(),
-                        interaction,
-                        vec![embed],
-                        Some(xiii_tickets::discord_io::after_close_components()),
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &err)
-                        .await;
-                }
+            if defer_slow_action {
+                defer_interaction_ephemeral_http(runtime.http.as_ref(), interaction).await;
             }
+            let response = match ticket_close_current_channel(interaction, runtime).await {
+                Ok(message) => message,
+                Err(err) => err,
+            };
+            update_interaction_response_ephemeral_http(
+                runtime.http.as_ref(),
+                interaction,
+                &response,
+            )
+            .await;
         }
         TicketComponentRoute::CloseCancel => {
             respond_interaction_update_embeds_http(
@@ -10741,41 +10788,96 @@ async fn handle_ticket_component(
             respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
         }
         TicketComponentRoute::Delete => {
+            if defer_slow_action {
+                defer_interaction_ephemeral_http(runtime.http.as_ref(), interaction).await;
+            }
             let response = match ticket_delete_current_channel(interaction, runtime).await {
                 Ok(message) => message,
                 Err(err) => err,
             };
-            respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
+            update_interaction_response_ephemeral_http(
+                runtime.http.as_ref(),
+                interaction,
+                &response,
+            )
+            .await;
         }
         TicketComponentRoute::ReopenMod => {
+            if defer_slow_action {
+                defer_interaction_ephemeral_http(runtime.http.as_ref(), interaction).await;
+            }
             let response = match ticket_reopen_current_channel(interaction, runtime).await {
                 Ok(message) => message,
                 Err(err) => err,
             };
-            respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
+            update_interaction_response_ephemeral_http(
+                runtime.http.as_ref(),
+                interaction,
+                &response,
+            )
+            .await;
         }
         TicketComponentRoute::DmReopen => {
+            if defer_slow_action {
+                defer_interaction_ephemeral_http(runtime.http.as_ref(), interaction).await;
+            }
             let response = match ticket_reopen_from_dm(interaction, runtime).await {
                 Ok(message) => message,
                 Err(err) => err,
             };
-            respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
+            update_interaction_response_ephemeral_http(
+                runtime.http.as_ref(),
+                interaction,
+                &response,
+            )
+            .await;
         }
         TicketComponentRoute::ApplicationAccept => {
+            if defer_slow_action {
+                defer_interaction_ephemeral_http(runtime.http.as_ref(), interaction).await;
+            }
             let response = match ticket_application_decision(interaction, runtime, true).await {
                 Ok(message) => message,
                 Err(err) => err,
             };
-            respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
+            update_interaction_response_ephemeral_http(
+                runtime.http.as_ref(),
+                interaction,
+                &response,
+            )
+            .await;
         }
         TicketComponentRoute::ApplicationReject => {
+            if defer_slow_action {
+                defer_interaction_ephemeral_http(runtime.http.as_ref(), interaction).await;
+            }
             let response = match ticket_application_decision(interaction, runtime, false).await {
                 Ok(message) => message,
                 Err(err) => err,
             };
-            respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &response).await;
+            update_interaction_response_ephemeral_http(
+                runtime.http.as_ref(),
+                interaction,
+                &response,
+            )
+            .await;
         }
     }
+}
+
+fn ticket_component_requires_deferred_ack(
+    route: xiii_tickets::interactions::TicketComponentRoute,
+) -> bool {
+    use xiii_tickets::interactions::TicketComponentRoute;
+    matches!(
+        route,
+        TicketComponentRoute::CloseConfirm
+            | TicketComponentRoute::Delete
+            | TicketComponentRoute::ReopenMod
+            | TicketComponentRoute::DmReopen
+            | TicketComponentRoute::ApplicationAccept
+            | TicketComponentRoute::ApplicationReject
+    )
 }
 
 async fn handle_ticket_custom_command(
@@ -10998,10 +11100,295 @@ async fn ticket_create_for_user(
     Ok(channel.id.get())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TicketTranscriptUpsertResult {
+    transcript_saved: bool,
+    dm_sent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TicketTranscriptMessageAction {
+    Create,
+    Update(u64),
+    Skip,
+}
+
+fn ticket_transcript_hash(body: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn ticket_missing_message_error(err: &str) -> bool {
+    err.contains("10008")
+        || err.contains("Unknown Message")
+        || err.contains("unknown message")
+        || err.contains("404")
+}
+
+fn ticket_transcript_message_action(
+    message_id: Option<u64>,
+    last_hash: Option<&str>,
+    next_hash: &str,
+) -> TicketTranscriptMessageAction {
+    match (message_id, last_hash == Some(next_hash)) {
+        (Some(_message_id), true) => TicketTranscriptMessageAction::Skip,
+        (Some(message_id), false) => TicketTranscriptMessageAction::Update(message_id),
+        (None, _) => TicketTranscriptMessageAction::Create,
+    }
+}
+
+async fn ticket_upsert_transcript_messages(
+    repo: &xiii_tickets::repository::LegacySqliteTicketRepository,
+    discord: &xiii_tickets::discord_io::TicketDiscordHttp,
+    runtime: &MixedSuperbotRuntime,
+    ticket: &xiii_tickets::state::TicketRecord,
+    closer_id: u64,
+    closed_at: chrono::DateTime<chrono::Utc>,
+    messages: &[xiii_tickets::render::TranscriptMessage],
+) -> Result<TicketTranscriptUpsertResult, String> {
+    let participant_count = (!messages.is_empty()).then(|| {
+        messages
+            .iter()
+            .map(|message| message.author_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+    });
+    let html = xiii_tickets::render::transcript_html(ticket, messages);
+    let transcript_hash = ticket_transcript_hash(&html);
+    let ticket_name = ticket
+        .ticket_name
+        .clone()
+        .unwrap_or_else(|| format!("ticket-{}", ticket.ticket_id));
+    let transcript_summary = xiii_tickets::render::transcript_summary_embed(
+        ticket,
+        closer_id,
+        closed_at,
+        participant_count,
+    );
+    let transcript_summary_embed = xiii_tickets::discord_io::embed_from_draft(&transcript_summary);
+    let transcript_payload = xiii_tickets::discord_io::transcript_payload(
+        runtime.config.tickets.transcript_channel_id,
+        &ticket_name,
+        html,
+    );
+    let mut runtime_state = repo.ticket_runtime_state(ticket.ticket_id).await?;
+
+    let transcript_channel_message_id = match ticket_transcript_message_action(
+        runtime_state.transcript_channel_message_id,
+        runtime_state.last_transcript_hash.as_deref(),
+        &transcript_hash,
+    ) {
+        TicketTranscriptMessageAction::Update(message_id) => match discord
+            .update_channel_transcript_message(
+                runtime.config.tickets.transcript_channel_id,
+                message_id,
+                &transcript_summary_embed,
+                &transcript_payload,
+                None,
+            )
+            .await
+        {
+            Ok(message) => Some(message.id.get()),
+            Err(err) if ticket_missing_message_error(&err) => {
+                println!(
+                    "[WARN] ticket transcript channel message missing; recreating ticket_id={} message_id={} error={}",
+                    ticket.ticket_id, message_id, err
+                );
+                Some(
+                    discord
+                        .send_channel_transcript_message(
+                            runtime.config.tickets.transcript_channel_id,
+                            &transcript_summary_embed,
+                            &transcript_payload,
+                            None,
+                        )
+                        .await?
+                        .id
+                        .get(),
+                )
+            }
+            Err(err) => return Err(err),
+        },
+        TicketTranscriptMessageAction::Create => Some(
+            discord
+                .send_channel_transcript_message(
+                    runtime.config.tickets.transcript_channel_id,
+                    &transcript_summary_embed,
+                    &transcript_payload,
+                    None,
+                )
+                .await?
+                .id
+                .get(),
+        ),
+        TicketTranscriptMessageAction::Skip => runtime_state.transcript_channel_message_id,
+    };
+
+    let transcript_dm_message_id = match ticket_transcript_message_action(
+        runtime_state.transcript_dm_message_id,
+        runtime_state.last_transcript_hash.as_deref(),
+        &transcript_hash,
+    ) {
+        TicketTranscriptMessageAction::Update(message_id) => match discord
+            .update_dm_transcript_message(
+                ticket.opener_id,
+                message_id,
+                &transcript_summary_embed,
+                &transcript_payload,
+                Some(xiii_tickets::discord_io::dm_reopen_components()),
+            )
+            .await
+        {
+            Ok(message_id) => message_id,
+            Err(err) if ticket_missing_message_error(&err) => {
+                println!(
+                    "[WARN] ticket transcript DM message missing; recreating ticket_id={} message_id={} error={}",
+                    ticket.ticket_id, message_id, err
+                );
+                discord
+                    .send_dm_transcript_message(
+                        ticket.opener_id,
+                        &transcript_summary_embed,
+                        &transcript_payload,
+                        Some(xiii_tickets::discord_io::dm_reopen_components()),
+                    )
+                    .await?
+            }
+            Err(err) => return Err(err),
+        },
+        TicketTranscriptMessageAction::Create => {
+            discord
+                .send_dm_transcript_message(
+                    ticket.opener_id,
+                    &transcript_summary_embed,
+                    &transcript_payload,
+                    Some(xiii_tickets::discord_io::dm_reopen_components()),
+                )
+                .await?
+        }
+        TicketTranscriptMessageAction::Skip => runtime_state.transcript_dm_message_id,
+    };
+
+    runtime_state.transcript_channel_message_id = transcript_channel_message_id;
+    runtime_state.last_transcript_hash = Some(transcript_hash);
+    repo.upsert_ticket_runtime_state(&runtime_state).await?;
+
+    runtime_state.transcript_dm_message_id = transcript_dm_message_id;
+    repo.upsert_ticket_runtime_state(&runtime_state).await?;
+
+    Ok(TicketTranscriptUpsertResult {
+        transcript_saved: runtime_state.transcript_channel_message_id.is_some(),
+        dm_sent: runtime_state.transcript_dm_message_id.is_some(),
+    })
+}
+
+async fn ticket_upsert_closed_controls_message(
+    repo: &xiii_tickets::repository::LegacySqliteTicketRepository,
+    discord: &xiii_tickets::discord_io::TicketDiscordHttp,
+    ticket: &xiii_tickets::state::TicketRecord,
+    embed: &Embed,
+) -> Result<(), String> {
+    let Some(channel_id) = ticket.channel_id else {
+        return Ok(());
+    };
+    let mut runtime_state = repo.ticket_runtime_state(ticket.ticket_id).await?;
+    let message_id = match runtime_state.closed_controls_message_id {
+        Some(message_id) => match discord
+            .update_channel_embed_message(
+                channel_id,
+                message_id,
+                embed,
+                Some(xiii_tickets::discord_io::after_close_components()),
+            )
+            .await
+        {
+            Ok(message) => message.id.get(),
+            Err(err) if ticket_missing_message_error(&err) => {
+                println!(
+                    "[WARN] ticket closed controls message missing; recreating ticket_id={} message_id={} error={}",
+                    ticket.ticket_id, message_id, err
+                );
+                discord
+                    .send_channel_embed_message(
+                        channel_id,
+                        embed,
+                        Some(xiii_tickets::discord_io::after_close_components()),
+                    )
+                    .await?
+                    .id
+                    .get()
+            }
+            Err(err) => return Err(err),
+        },
+        None => discord
+            .send_channel_embed_message(
+                channel_id,
+                embed,
+                Some(xiii_tickets::discord_io::after_close_components()),
+            )
+            .await?
+            .id
+            .get(),
+    };
+    runtime_state.closed_controls_message_id = Some(message_id);
+    repo.upsert_ticket_runtime_state(&runtime_state).await
+}
+
+async fn ticket_clear_closed_controls_message(
+    repo: &xiii_tickets::repository::LegacySqliteTicketRepository,
+    discord: &xiii_tickets::discord_io::TicketDiscordHttp,
+    ticket: &xiii_tickets::state::TicketRecord,
+) -> Result<(), String> {
+    let Some(channel_id) = ticket.channel_id else {
+        return Ok(());
+    };
+    let mut runtime_state = repo.ticket_runtime_state(ticket.ticket_id).await?;
+    let Some(message_id) = runtime_state.closed_controls_message_id else {
+        return Ok(());
+    };
+    match discord.delete_message(channel_id, message_id).await {
+        Ok(()) => {}
+        Err(err) if ticket_missing_message_error(&err) => {
+            println!(
+                "[WARN] ticket closed controls message already missing; clearing state ticket_id={} message_id={} error={}",
+                ticket.ticket_id, message_id, err
+            );
+        }
+        Err(err) => return Err(err),
+    }
+    runtime_state.closed_controls_message_id = None;
+    repo.upsert_ticket_runtime_state(&runtime_state).await
+}
+
+async fn ticket_cleanup_confirmation_message(
+    interaction: &Interaction,
+    discord: &xiii_tickets::discord_io::TicketDiscordHttp,
+) {
+    let Some(message) = interaction.message.as_ref() else {
+        return;
+    };
+    if let Err(err) = discord
+        .delete_message(message.channel_id.get(), message.id.get())
+        .await
+    {
+        println!(
+            "[WARN] ticket confirmation message delete failed: channel_id={} message_id={} error={}",
+            message.channel_id.get(),
+            message.id.get(),
+            err
+        );
+        let disabled = xiii_tickets::discord_io::disabled_components(&message.components);
+        let _ = discord
+            .update_message_components(message.channel_id.get(), message.id.get(), &disabled)
+            .await;
+    }
+}
+
 async fn ticket_close_current_channel(
     interaction: &Interaction,
     runtime: &MixedSuperbotRuntime,
-) -> Result<Embed, String> {
+) -> Result<String, String> {
     let channel_id = interaction_channel_id(interaction)
         .ok_or_else(|| "This action must be used in a ticket channel.".to_owned())?;
     let closer_id = interaction
@@ -11020,48 +11407,11 @@ async fn ticket_close_current_channel(
         .get_ticket_by_channel_id(channel_id)
         .await?
         .ok_or_else(|| "This channel is not a tracked ticket channel.".to_owned())?;
-    let closed_at = chrono::Utc::now();
-    let messages = discord
-        .fetch_transcript_messages(channel_id, xiii_tickets::runtime::TRANSCRIPT_FETCH_LIMIT)
-        .await
-        .unwrap_or_default();
-    let participant_count = (!messages.is_empty()).then(|| {
-        messages
-            .iter()
-            .map(|message| message.author_id)
-            .collect::<BTreeSet<_>>()
-            .len()
-    });
-    let html = xiii_tickets::render::transcript_html(&ticket, &messages);
     let ticket_name = ticket
         .ticket_name
         .clone()
         .unwrap_or_else(|| format!("ticket-{}", ticket.ticket_id));
-    let transcript_summary = xiii_tickets::render::transcript_summary_embed(
-        &ticket,
-        closer_id,
-        closed_at,
-        participant_count,
-    );
-    let transcript_summary_embed = xiii_tickets::discord_io::embed_from_draft(&transcript_summary);
-    let transcript_payload = xiii_tickets::discord_io::transcript_payload(
-        runtime.config.tickets.transcript_channel_id,
-        &ticket_name,
-        html,
-    );
-    let transcript_saved = if discord
-        .send_channel_embed_message(
-            runtime.config.tickets.transcript_channel_id,
-            &transcript_summary_embed,
-            None,
-        )
-        .await
-        .is_ok()
-    {
-        discord.send_transcript(&transcript_payload).await.is_ok()
-    } else {
-        false
-    };
+    let closed_at = chrono::Utc::now();
     let closed = repo
         .mark_ticket_closed_by_channel(
             channel_id,
@@ -11070,6 +11420,14 @@ async fn ticket_close_current_channel(
         )
         .await?;
     if let Some(closed) = closed {
+        let messages = discord
+            .fetch_transcript_messages(channel_id, xiii_tickets::runtime::TRANSCRIPT_FETCH_LIMIT)
+            .await
+            .unwrap_or_default();
+        let transcript_result = ticket_upsert_transcript_messages(
+            repo, discord, runtime, &closed, closer_id, closed_at, &messages,
+        )
+        .await?;
         let closed_name = format!("closed-{}", ticket_name.trim_start_matches("closed-"));
         let _ = discord.rename_channel(channel_id, &closed_name).await;
         let _ = discord
@@ -11078,25 +11436,14 @@ async fn ticket_close_current_channel(
                 &xiii_tickets::discord_io::closed_ticket_owner_overwrite(closed.opener_id),
             )
             .await;
-        let dm_sent = if transcript_saved {
-            discord
-                .send_dm_embed_message(
-                    closed.opener_id,
-                    &transcript_summary_embed,
-                    Some(xiii_tickets::discord_io::dm_reopen_components()),
-                )
-                .await
-                .is_ok()
-                && discord
-                    .send_dm_transcript(closed.opener_id, &transcript_payload)
-                    .await
-                    .is_ok()
-        } else {
-            false
-        };
-        Ok(xiii_tickets::discord_io::embed_from_draft(
-            &xiii_tickets::render::close_result_embed(transcript_saved, dm_sent),
-        ))
+        let close_result_embed =
+            xiii_tickets::discord_io::embed_from_draft(&xiii_tickets::render::close_result_embed(
+                transcript_result.transcript_saved,
+                transcript_result.dm_sent,
+            ));
+        ticket_upsert_closed_controls_message(repo, discord, &closed, &close_result_embed).await?;
+        ticket_cleanup_confirmation_message(interaction, discord).await;
+        Ok(xiii_tickets::render::CLOSE_SUCCESS_TEXT.to_owned())
     } else {
         Err("Ticket was already closed or is not open.".to_owned())
     }
@@ -11108,6 +11455,10 @@ async fn ticket_delete_current_channel(
 ) -> Result<String, String> {
     let channel_id = interaction_channel_id(interaction)
         .ok_or_else(|| "This action must be used in a ticket channel.".to_owned())?;
+    let actor_id = interaction
+        .author_id()
+        .map(|id| id.get())
+        .unwrap_or_default();
     let repo = runtime
         .ticket_repo
         .as_ref()
@@ -11120,23 +11471,21 @@ async fn ticket_delete_current_channel(
         .get_ticket_by_channel_id(channel_id)
         .await?
         .ok_or_else(|| "This channel is not a tracked ticket channel.".to_owned())?;
-    let ticket_name = ticket
-        .ticket_name
-        .clone()
-        .unwrap_or_else(|| format!("ticket-{}", ticket.ticket_id));
     if ticket.status != xiii_tickets::state::TicketStatus::Closed {
         let messages = discord
             .fetch_transcript_messages(channel_id, xiii_tickets::runtime::TRANSCRIPT_FETCH_LIMIT)
             .await
             .unwrap_or_default();
-        let html = xiii_tickets::render::transcript_html(&ticket, &messages);
-        discord
-            .send_transcript(&xiii_tickets::discord_io::transcript_payload(
-                runtime.config.tickets.transcript_channel_id,
-                &ticket_name,
-                html,
-            ))
-            .await?;
+        let _ = ticket_upsert_transcript_messages(
+            repo,
+            discord,
+            runtime,
+            &ticket,
+            actor_id,
+            chrono::Utc::now(),
+            &messages,
+        )
+        .await?;
     }
     if repo.mark_ticket_deleted_by_channel(channel_id).await? {
         discord.delete_channel(channel_id).await?;
@@ -11185,6 +11534,7 @@ async fn ticket_reopen_current_channel(
                 &xiii_tickets::discord_io::reopen_ticket_owner_overwrite(ticket.opener_id),
             )
             .await;
+        let _ = ticket_clear_closed_controls_message(repo, discord, &ticket).await;
         let _ = discord
             .send_channel_message(
                 channel_id,
@@ -14900,24 +15250,30 @@ fn print_report(title: &str, report: &Report) {
 mod tests {
     use super::{
         bootstrap_permission_failure, build_module_status_report, clanlist_health_from_outcome,
-        clanlist_interval_seconds, collect_json_message_targets, discord_read_permission_failure,
+        clanlist_interval_seconds, collect_json_message_targets,
+        deferred_ephemeral_interaction_response, discord_read_permission_failure,
         duration_between_iso_clamped, emit_output, legacy_parity_modules, module_manifests,
         module_render_preview, parse_old_service_status, parse_retry_after_from_body,
         production_path_issue, render_preview_json, resolve_health_output_path,
         resolve_state_file_path, resolve_state_output_path, retry_delay_for_attempt,
         run_clanlist_permission_failure, run_superbot_permission_failure, sync_command_plan,
+        ticket_component_requires_deferred_ack, ticket_transcript_message_action,
         update_permission_failure, valid_voice_cutover_state, validate_fresh_state_json,
         validate_output_path, write_clanlist_health, write_plan_permission_failure,
         ClanlistRefreshOutcome, LegacyParityStatus, ModuleReadiness, NonOverlapGuard,
         OldServiceStatus, SuperbotModuleKind, SyncPlanStatus, TempVoiceOccupancy,
+        TicketTranscriptMessageAction,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+    use twilight_model::channel::message::MessageFlags;
+    use twilight_model::http::interaction::InteractionResponseType;
     use xiii_config::{ConfigPath, SuperbotConfig};
     use xiii_core::Report;
     use xiii_discord::CentralRouter;
+    use xiii_tickets::interactions::TicketComponentRoute;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -15433,6 +15789,63 @@ mod tests {
 
         assert!(err.contains("LEGACY_CLANLIST_DATA_DIR") || err.contains("old Clanlist"));
         cleanup_dir(dir);
+    }
+
+    #[test]
+    fn ticket_slow_component_routes_require_deferred_ack() {
+        assert!(ticket_component_requires_deferred_ack(
+            TicketComponentRoute::CloseConfirm
+        ));
+        assert!(ticket_component_requires_deferred_ack(
+            TicketComponentRoute::Delete
+        ));
+        assert!(ticket_component_requires_deferred_ack(
+            TicketComponentRoute::ReopenMod
+        ));
+        assert!(ticket_component_requires_deferred_ack(
+            TicketComponentRoute::DmReopen
+        ));
+        assert!(ticket_component_requires_deferred_ack(
+            TicketComponentRoute::ApplicationAccept
+        ));
+        assert!(ticket_component_requires_deferred_ack(
+            TicketComponentRoute::ApplicationReject
+        ));
+        assert!(!ticket_component_requires_deferred_ack(
+            TicketComponentRoute::Close
+        ));
+        assert!(!ticket_component_requires_deferred_ack(
+            TicketComponentRoute::CloseCancel
+        ));
+    }
+
+    #[test]
+    fn deferred_ephemeral_response_is_built_for_ticket_slow_actions() {
+        let response = deferred_ephemeral_interaction_response();
+        assert_eq!(
+            response.kind,
+            InteractionResponseType::DeferredChannelMessageWithSource
+        );
+        assert_eq!(
+            response.data.and_then(|data| data.flags),
+            Some(MessageFlags::EPHEMERAL)
+        );
+    }
+
+    #[test]
+    fn transcript_message_action_skips_unchanged_hash_and_updates_existing_messages() {
+        assert_eq!(
+            ticket_transcript_message_action(Some(42), Some("same"), "same"),
+            TicketTranscriptMessageAction::Skip
+        );
+        assert_eq!(
+            ticket_transcript_message_action(Some(42), Some("old"), "new"),
+            TicketTranscriptMessageAction::Update(42)
+        );
+        assert_eq!(
+            ticket_transcript_message_action(None, None, "new"),
+            TicketTranscriptMessageAction::Create
+        );
     }
 
     #[test]

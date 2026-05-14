@@ -1,6 +1,7 @@
 use crate::runtime::ticket_channel_name;
 use crate::state::{
-    format_utc, GoogleFormRow, ReservedTicket, Ticket, TicketRecord, TicketStatus, TicketType,
+    format_utc, GoogleFormRow, ReservedTicket, Ticket, TicketRecord, TicketRuntimeState,
+    TicketStatus, TicketType,
 };
 use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
@@ -92,11 +93,15 @@ impl LegacySqliteTicketRepository {
                 .await
                 .map_err(|err| format!("failed to set PRAGMA query_only=ON: {err}"))?;
         }
-        Ok(Self {
+        let repo = Self {
             path: path.to_path_buf(),
             pool,
             writes_enabled: writable,
-        })
+        };
+        if writable {
+            repo.ensure_runtime_state_schema().await?;
+        }
+        Ok(repo)
     }
 
     pub fn path(&self) -> &Path {
@@ -132,6 +137,7 @@ impl LegacySqliteTicketRepository {
                 .await
                 .map_err(|err| format!("failed to create ticket test schema: {err}"))?;
         }
+        self.ensure_runtime_state_schema().await?;
         Ok(())
     }
 
@@ -562,6 +568,68 @@ impl LegacySqliteTicketRepository {
         Ok(())
     }
 
+    pub async fn ticket_runtime_state(&self, ticket_id: i64) -> Result<TicketRuntimeState, String> {
+        let row = sqlx::query(
+            "SELECT
+                ticket_id,
+                transcript_channel_message_id,
+                transcript_dm_message_id,
+                closed_controls_message_id,
+                last_transcript_hash
+             FROM ticket_runtime_state
+             WHERE ticket_id=?",
+        )
+        .bind(ticket_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| format!("failed to read ticket runtime state {ticket_id}: {err}"))?;
+        row.as_ref()
+            .map(ticket_runtime_state_from_row)
+            .transpose()
+            .map(|state| {
+                state.unwrap_or_else(|| TicketRuntimeState {
+                    ticket_id,
+                    ..TicketRuntimeState::default()
+                })
+            })
+    }
+
+    pub async fn upsert_ticket_runtime_state(
+        &self,
+        state: &TicketRuntimeState,
+    ) -> Result<(), String> {
+        self.ensure_writable()?;
+        self.ensure_runtime_state_schema().await?;
+        sqlx::query(
+            "INSERT INTO ticket_runtime_state(
+                ticket_id,
+                transcript_channel_message_id,
+                transcript_dm_message_id,
+                closed_controls_message_id,
+                last_transcript_hash
+             ) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(ticket_id) DO UPDATE SET
+                transcript_channel_message_id=excluded.transcript_channel_message_id,
+                transcript_dm_message_id=excluded.transcript_dm_message_id,
+                closed_controls_message_id=excluded.closed_controls_message_id,
+                last_transcript_hash=excluded.last_transcript_hash",
+        )
+        .bind(state.ticket_id)
+        .bind(state.transcript_channel_message_id.map(|id| id.to_string()))
+        .bind(state.transcript_dm_message_id.map(|id| id.to_string()))
+        .bind(state.closed_controls_message_id.map(|id| id.to_string()))
+        .bind(state.last_transcript_hash.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to upsert ticket runtime state {}: {err}",
+                state.ticket_id
+            )
+        })?;
+        Ok(())
+    }
+
     async fn count_table(&self, table: &str) -> Result<i64, String> {
         let sql = format!("SELECT COUNT(*) AS count FROM {table}");
         let row = sqlx::query(&sql)
@@ -586,6 +654,23 @@ impl LegacySqliteTicketRepository {
         } else {
             Err("ticket repository was opened read-only; write refused".to_owned())
         }
+    }
+
+    async fn ensure_runtime_state_schema(&self) -> Result<(), String> {
+        self.ensure_writable()?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS ticket_runtime_state (
+                ticket_id INTEGER PRIMARY KEY,
+                transcript_channel_message_id TEXT,
+                transcript_dm_message_id TEXT,
+                closed_controls_message_id TEXT,
+                last_transcript_hash TEXT
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|err| format!("failed to ensure ticket_runtime_state schema: {err}"))?;
+        Ok(())
     }
 }
 
@@ -671,6 +756,30 @@ fn ticket_record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TicketRecord,
         created_at_utc: row.get::<String, _>("created_at_utc"),
         closed_at_utc: row.get::<Option<String>, _>("closed_at_utc"),
         reopen_until_utc: row.get::<Option<String>, _>("reopen_until_utc"),
+    })
+}
+
+fn ticket_runtime_state_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<TicketRuntimeState, String> {
+    Ok(TicketRuntimeState {
+        ticket_id: row.get::<i64, _>("ticket_id"),
+        transcript_channel_message_id: row
+            .get::<Option<String>, _>("transcript_channel_message_id")
+            .as_deref()
+            .map(|value| parse_u64(value, "transcript_channel_message_id"))
+            .transpose()?,
+        transcript_dm_message_id: row
+            .get::<Option<String>, _>("transcript_dm_message_id")
+            .as_deref()
+            .map(|value| parse_u64(value, "transcript_dm_message_id"))
+            .transpose()?,
+        closed_controls_message_id: row
+            .get::<Option<String>, _>("closed_controls_message_id")
+            .as_deref()
+            .map(|value| parse_u64(value, "closed_controls_message_id"))
+            .transpose()?,
+        last_transcript_hash: row.get::<Option<String>, _>("last_transcript_hash"),
     })
 }
 
