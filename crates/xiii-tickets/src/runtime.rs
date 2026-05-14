@@ -9,6 +9,7 @@ pub const LEGACY_GOOGLE_TICKET_NUMBER_INDEX: usize = 19;
 pub const DEFAULT_MAX_OPEN_TICKETS_PER_USER: i64 = 2;
 pub const DEFAULT_REOPEN_WINDOW_HOURS: i64 = 5;
 pub const TRANSCRIPT_FETCH_LIMIT: usize = 1000;
+pub const ACCEPT_NICKNAME_PREFIX: &str = "[✧︎✧︎]";
 
 pub fn next_ticket_number(current_counter_value: i64) -> i64 {
     current_counter_value + 1
@@ -93,6 +94,13 @@ pub struct GooglePollDecision {
 pub enum GooglePollAction {
     SkipAlreadyProcessed,
     QueueOfficerReview(OfficerReviewDraft),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptRoleOperations {
+    pub remove_guest_role_id: Option<u64>,
+    pub add_role_ids: Vec<u64>,
+    pub new_nickname: Option<String>,
 }
 
 pub fn build_creation_plan(
@@ -183,8 +191,16 @@ pub fn officer_review_description(row: &GoogleFormRow, ticket_number: Option<i64
     crate::render::officer_review_description(&row.values, ticket_number)
 }
 
-pub fn accept_application_text() -> &'static str {
-    crate::render::accept_application_channel_text()
+pub fn applicant_test_failed_text() -> &'static str {
+    crate::render::applicant_test_failed_channel_text()
+}
+
+pub fn applicant_test_passed_text(interviewer_role_id: u64) -> String {
+    crate::render::applicant_test_passed_channel_text(interviewer_role_id)
+}
+
+pub fn accept_application_text(interviewer_role_id: u64) -> String {
+    crate::render::accept_application_channel_text(interviewer_role_id)
 }
 
 pub fn reject_application_text() -> &'static str {
@@ -201,4 +217,33 @@ pub fn reopen_dm_text(ticket_name: &str) -> String {
 
 fn non_zero(value: u64) -> Option<u64> {
     (value != 0).then_some(value)
+}
+
+pub fn accept_role_operations(
+    current_role_ids: &[u64],
+    current_display_name: &str,
+    guest_role_id: u64,
+    accept_role_ids: &[u64],
+) -> AcceptRoleOperations {
+    let remove_guest_role_id =
+        (guest_role_id != 0 && current_role_ids.contains(&guest_role_id)).then_some(guest_role_id);
+    let add_role_ids = accept_role_ids
+        .iter()
+        .copied()
+        .filter(|role_id| !current_role_ids.contains(role_id))
+        .collect::<Vec<_>>();
+    let new_nickname = if current_display_name.starts_with(ACCEPT_NICKNAME_PREFIX) {
+        None
+    } else {
+        let mut nick = format!("{ACCEPT_NICKNAME_PREFIX} {current_display_name}");
+        if nick.chars().count() > 32 {
+            nick = nick.chars().take(32).collect();
+        }
+        Some(nick)
+    };
+    AcceptRoleOperations {
+        remove_guest_role_id,
+        add_role_ids,
+        new_nickname,
+    }
 }

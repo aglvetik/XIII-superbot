@@ -11248,6 +11248,13 @@ async fn ticket_application_decision(
     if !allowed {
         return Err("Access denied for application decision.".to_owned());
     }
+    if interaction
+        .message
+        .as_ref()
+        .is_some_and(|message| !ticket_message_has_enabled_buttons(&message.components))
+    {
+        return Ok("Решение уже принято.".to_owned());
+    }
     let channel_id = parse_ticket_target_channel_from_interaction(interaction)
         .or_else(|| interaction_channel_id(interaction))
         .ok_or_else(|| "Could not resolve target ticket channel.".to_owned())?;
@@ -11266,30 +11273,27 @@ async fn ticket_application_decision(
     if ticket.ticket_type != xiii_tickets::state::TicketType::Application {
         return Err("Target ticket is not an application ticket.".to_owned());
     }
-    if accept {
-        for role_id in &runtime.config.tickets.accept_role_ids {
-            let _ = discord
-                .add_member_role(runtime.config.core.guild_id, ticket.opener_id, *role_id)
-                .await;
-        }
-        let _ = discord
-            .send_channel_message(
-                channel_id,
-                xiii_tickets::runtime::accept_application_text(),
-                &[],
-            )
-            .await;
-        Ok("Готово: игрок принят ✅".to_owned())
-    } else {
-        let _ = discord
-            .send_channel_message(
-                channel_id,
-                xiii_tickets::runtime::reject_application_text(),
-                &[],
-            )
-            .await;
-        Ok("Готово: игрок отклонён ❌".to_owned())
+    let decision_key = ticket_application_decision_key(channel_id);
+    if !repo
+        .try_claim_bot_state(&decision_key, if accept { "accepted" } else { "rejected" })
+        .await?
+    {
+        return Ok("Решение уже принято.".to_owned());
     }
+    let response =
+        ticket_apply_application_decision(runtime, discord, channel_id, ticket.opener_id, accept)
+            .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            let _ = repo.delete_bot_state(&decision_key).await;
+            return Err(err);
+        }
+    };
+    if let Err(err) = ticket_disable_officer_review_buttons(interaction, discord).await {
+        println!("[WARN] ticket officer review button disable failed: {err}");
+    }
+    Ok(response)
 }
 
 async fn handle_ticket_staff_notes_modal(
@@ -11383,27 +11387,24 @@ async fn ticket_application_decision_from_message(
     if ticket.ticket_type != xiii_tickets::state::TicketType::Application {
         return Err("message channel is not an application ticket".to_owned());
     }
-    if accept {
-        for role_id in &runtime.config.tickets.accept_role_ids {
-            let _ = discord
-                .add_member_role(runtime.config.core.guild_id, ticket.opener_id, *role_id)
-                .await;
-        }
-        discord
-            .send_channel_message(
-                message.channel_id.get(),
-                xiii_tickets::runtime::accept_application_text(),
-                &[],
-            )
-            .await?;
-    } else {
-        discord
-            .send_channel_message(
-                message.channel_id.get(),
-                xiii_tickets::runtime::reject_application_text(),
-                &[],
-            )
-            .await?;
+    let decision_key = ticket_application_decision_key(message.channel_id.get());
+    if !repo
+        .try_claim_bot_state(&decision_key, if accept { "accepted" } else { "rejected" })
+        .await?
+    {
+        return Ok(());
+    }
+    if let Err(err) = ticket_apply_application_decision(
+        runtime,
+        discord,
+        message.channel_id.get(),
+        ticket.opener_id,
+        accept,
+    )
+    .await
+    {
+        let _ = repo.delete_bot_state(&decision_key).await;
+        return Err(err);
     }
     Ok(())
 }
@@ -11431,18 +11432,82 @@ async fn ticket_google_forms_poll_tick(runtime: &MixedSuperbotRuntime) -> Result
         {
             continue;
         }
+        let raw_score = row.values.get(2).map(String::as_str).unwrap_or_default();
+        let parsed_score = xiii_tickets::render::parse_officer_review_score(raw_score);
         let Some(ticket_number) = xiii_tickets::runtime::ticket_number_from_google_row(&row) else {
+            println!(
+                "[WARN] ticket google row skipped: row={} reason=invalid_ticket_number",
+                row.sheet_row
+            );
+            repo.mark_form_processed(row.sheet_row, &signature, chrono::Utc::now())
+                .await?;
+            println!(
+                "[INFO] ticket google row processed: row={} processed_row_marked=true",
+                row.sheet_row
+            );
             continue;
         };
+        let Some(score) = parsed_score.as_ref() else {
+            println!(
+                "[WARN] ticket google row skipped: row={} ticket={} reason=invalid_score raw_score={:?}",
+                row.sheet_row, ticket_number, raw_score
+            );
+            repo.mark_form_processed(row.sheet_row, &signature, chrono::Utc::now())
+                .await?;
+            println!(
+                "[INFO] ticket google row processed: row={} ticket={} processed_row_marked=true",
+                row.sheet_row, ticket_number
+            );
+            continue;
+        };
+        let passed = score.value >= 7.0;
         let Some(ticket) = repo
             .find_application_ticket_by_number(ticket_number)
             .await?
         else {
+            println!(
+                "[WARN] ticket google row waiting: row={} ticket={} reason=ticket_not_found score={} pass={}",
+                row.sheet_row, ticket_number, score.display, passed
+            );
             continue;
         };
         let Some(channel_id) = ticket.channel_id else {
+            println!(
+                "[WARN] ticket google row waiting: row={} ticket={} reason=ticket_channel_missing score={} pass={}",
+                row.sheet_row, ticket_number, score.display, passed
+            );
             continue;
         };
+        println!(
+            "[INFO] ticket google row matched: row={} ticket={} ticket_channel_id={} score={} pass={}",
+            row.sheet_row, ticket_number, channel_id, score.display, passed
+        );
+        let applicant_message = if passed {
+            xiii_tickets::runtime::applicant_test_passed_text(ticket_interviewer_role_id(runtime))
+        } else {
+            xiii_tickets::runtime::applicant_test_failed_text().to_owned()
+        };
+        discord
+            .send_channel_message(channel_id, &applicant_message, &[])
+            .await?;
+        println!(
+            "[INFO] ticket google applicant notification sent: row={} ticket={} ticket_channel_id={} pass={}",
+            row.sheet_row, ticket_number, channel_id, passed
+        );
+        if !passed {
+            repo.mark_form_processed_after_send(
+                true,
+                row.sheet_row,
+                &signature,
+                chrono::Utc::now(),
+            )
+            .await?;
+            println!(
+                "[INFO] ticket google row processed: row={} ticket={} processed_row_marked=true",
+                row.sheet_row, ticket_number
+            );
+            continue;
+        }
         let description =
             xiii_tickets::runtime::officer_review_description(&row, Some(ticket_number));
         let payload = xiii_tickets::discord_io::officer_review_payload(
@@ -11456,8 +11521,19 @@ async fn ticket_google_forms_poll_tick(runtime: &MixedSuperbotRuntime) -> Result
             },
         );
         discord.send_officer_review(&payload).await?;
+        println!(
+            "[INFO] ticket google officer review sent: row={} ticket={} ticket_channel_id={} officer_channel_id={}",
+            row.sheet_row,
+            ticket_number,
+            channel_id,
+            runtime.config.tickets.officer_review_channel_id
+        );
         repo.mark_form_processed_after_send(true, row.sheet_row, &signature, chrono::Utc::now())
             .await?;
+        println!(
+            "[INFO] ticket google row processed: row={} ticket={} processed_row_marked=true",
+            row.sheet_row, ticket_number
+        );
     }
     Ok(())
 }
@@ -11561,6 +11637,164 @@ fn message_author_can_accept(message: &DiscordMessage, runtime: &MixedSuperbotRu
             &roles,
             &runtime.config.tickets.global_moderator_role_ids,
         )
+}
+
+async fn ticket_apply_application_decision(
+    runtime: &MixedSuperbotRuntime,
+    discord: &xiii_tickets::discord_io::TicketDiscordHttp,
+    channel_id: u64,
+    opener_id: u64,
+    accept: bool,
+) -> Result<String, String> {
+    if !accept {
+        discord
+            .send_channel_message(
+                channel_id,
+                xiii_tickets::runtime::reject_application_text(),
+                &[],
+            )
+            .await?;
+        return Ok("Готово: игрок отклонён ❌".to_owned());
+    }
+
+    let opener = match fetch_member_checked(runtime, runtime.config.core.guild_id, opener_id).await
+    {
+        Ok(member) => member,
+        Err(err) => {
+            let warning =
+                format!("⚠️ Не смог применить ACCEPT: участник не найден (opener_id={opener_id}).");
+            let _ = discord
+                .send_channel_message(channel_id, &warning, &[])
+                .await;
+            return Err(format!("Не удалось применить ACCEPT: {err}"));
+        }
+    };
+    let current_roles = opener
+        .roles
+        .iter()
+        .map(|role_id| role_id.get())
+        .collect::<Vec<_>>();
+    let current_display_name = ticket_member_display_name(&opener);
+    let operations = xiii_tickets::runtime::accept_role_operations(
+        &current_roles,
+        &current_display_name,
+        runtime.config.recruit.guest_role_id,
+        &runtime.config.tickets.accept_role_ids,
+    );
+
+    discord
+        .send_channel_message(
+            channel_id,
+            &xiii_tickets::runtime::accept_application_text(ticket_interviewer_role_id(runtime)),
+            &[],
+        )
+        .await?;
+
+    let mut warnings = Vec::new();
+    if let Some(guest_role_id) = operations.remove_guest_role_id {
+        if let Err(err) = discord
+            .remove_member_role(runtime.config.core.guild_id, opener_id, guest_role_id)
+            .await
+        {
+            ticket_log_role_failure(opener_id, guest_role_id, "remove_guest_role", &err);
+            warnings.push("Не удалось снять гостевую роль.".to_owned());
+        }
+    }
+    for role_id in operations.add_role_ids {
+        if let Err(err) = discord
+            .add_member_role(runtime.config.core.guild_id, opener_id, role_id)
+            .await
+        {
+            ticket_log_role_failure(opener_id, role_id, "add_accept_role", &err);
+            warnings.push(format!("Не удалось выдать роль <@&{role_id}>."));
+        }
+    }
+    if let Some(nickname) = operations.new_nickname.as_deref() {
+        if let Err(err) = discord
+            .update_member_nick(runtime.config.core.guild_id, opener_id, nickname)
+            .await
+        {
+            ticket_log_nick_failure(opener_id, "update_accept_nickname", &err);
+            warnings.push(
+                "Роли обновлены, но ник не изменён. Проверь права Manage Nicknames.".to_owned(),
+            );
+        }
+    }
+
+    if warnings.is_empty() {
+        Ok("Готово: игрок принят ✅".to_owned())
+    } else {
+        Ok(format!("Готово: игрок принят ✅\n{}", warnings.join("\n")))
+    }
+}
+
+async fn ticket_disable_officer_review_buttons(
+    interaction: &Interaction,
+    discord: &xiii_tickets::discord_io::TicketDiscordHttp,
+) -> Result<(), String> {
+    let Some(message) = interaction.message.as_ref() else {
+        return Ok(());
+    };
+    if !ticket_message_has_enabled_buttons(&message.components) {
+        return Ok(());
+    }
+    let disabled = xiii_tickets::discord_io::disabled_components(&message.components);
+    discord
+        .update_message_components(message.channel_id.get(), message.id.get(), &disabled)
+        .await
+}
+
+fn ticket_interviewer_role_id(runtime: &MixedSuperbotRuntime) -> u64 {
+    read_env_value(&runtime.env_file, "XIII_INTERVIEWER_ROLE_ID")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|role_id| *role_id != 0)
+        .unwrap_or(runtime.config.tickets.application_ping_role_id)
+}
+
+fn ticket_member_display_name(member: &DiscordMember) -> String {
+    member
+        .nick
+        .clone()
+        .or(member.user.global_name.clone())
+        .unwrap_or_else(|| member.user.name.clone())
+}
+
+fn ticket_log_role_failure(user_id: u64, role_id: u64, action: &str, err: &str) {
+    let reason = if err.contains("50013") || err.contains("Missing Permissions") {
+        "Missing Permissions / 50013"
+    } else {
+        "Discord role operation failed"
+    };
+    println!(
+        "[WARN] ticket application role operation failed: user_id={} role_id={} action={} reason={} error={}",
+        user_id, role_id, action, reason, err
+    );
+}
+
+fn ticket_log_nick_failure(user_id: u64, action: &str, err: &str) {
+    let reason = if err.contains("50013") || err.contains("Missing Permissions") {
+        "Missing Permissions / 50013"
+    } else {
+        "Discord nickname update failed"
+    };
+    println!(
+        "[WARN] ticket application nickname update failed: user_id={} action={} reason={} error={}",
+        user_id, action, reason, err
+    );
+}
+
+fn ticket_application_decision_key(channel_id: u64) -> String {
+    format!("ticket_application_decision:{channel_id}")
+}
+
+fn ticket_message_has_enabled_buttons(components: &[Component]) -> bool {
+    components.iter().any(|component| match component {
+        Component::ActionRow(row) => row.components.iter().any(|nested| match nested {
+            Component::Button(button) => !button.disabled,
+            _ => false,
+        }),
+        _ => false,
+    })
 }
 
 fn parse_ticket_target_channel_from_interaction(interaction: &Interaction) -> Option<u64> {

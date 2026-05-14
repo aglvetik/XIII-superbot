@@ -30,9 +30,10 @@ use crate::render::{
 };
 use crate::repository::{google_form_signature, LegacySqliteTicketRepository};
 use crate::runtime::{
+    accept_role_operations, applicant_test_failed_text, applicant_test_passed_text,
     build_creation_plan, google_poll_decision, lifecycle_plan, lifecycle_transition,
     next_ticket_number, open_tickets_for_user, ping_role_for_ticket_type, ticket_channel_name,
-    GooglePollAction, TicketLifecycleAction,
+    GooglePollAction, TicketLifecycleAction, ACCEPT_NICKNAME_PREFIX,
 };
 use crate::state::{GoogleFormRow, Ticket, TicketStatus, TicketType};
 use chrono::{TimeZone, Utc};
@@ -371,6 +372,47 @@ fn google_score_parser_accepts_legacy_google_formats() {
 }
 
 #[test]
+fn applicant_test_notifications_match_legacy_copy() {
+    let passed = applicant_test_passed_text(1498057076151422976);
+    let failed = applicant_test_failed_text();
+
+    assert!(passed.starts_with("### Поздравляю вы прошли тест."));
+    assert!(passed.contains("<@&1498057076151422976>"));
+    assert!(failed.starts_with("### К сожалению вы не прошли тест"));
+    assert!(failed.contains("### Если не осталось вопросов закройте тикет."));
+}
+
+#[test]
+fn accept_role_operations_match_legacy_behavior() {
+    let ops = accept_role_operations(
+        &[1498022112114249825, 10],
+        "RecruitName",
+        1498022112114249825,
+        &[1498022112114249828, 1498022112114249827],
+    );
+
+    assert_eq!(ops.remove_guest_role_id, Some(1498022112114249825));
+    assert_eq!(
+        ops.add_role_ids,
+        vec![1498022112114249828, 1498022112114249827]
+    );
+    assert_eq!(
+        ops.new_nickname,
+        Some(format!("{ACCEPT_NICKNAME_PREFIX} RecruitName"))
+    );
+
+    let already_applied = accept_role_operations(
+        &[1498022112114249828, 1498022112114249827],
+        "[✧︎✧︎] RecruitName",
+        1498022112114249825,
+        &[1498022112114249828, 1498022112114249827],
+    );
+    assert_eq!(already_applied.remove_guest_role_id, None);
+    assert!(already_applied.add_role_ids.is_empty());
+    assert_eq!(already_applied.new_nickname, None);
+}
+
+#[test]
 fn google_read_plan_redacts_credentials_and_builds_range() {
     let config = GoogleSheetsPollConfig {
         credentials_file: PathBuf::from("credentials.json"),
@@ -693,6 +735,33 @@ async fn processed_marker_is_written_only_after_successful_send() {
         .unwrap());
     assert!(repo.processed_form_row_exists(15).await.unwrap());
     assert!(repo.form_signature_processed_async("sig-15").await.unwrap());
+    cleanup_dir(dir);
+}
+
+#[tokio::test]
+async fn bot_state_claim_prevents_duplicate_application_decisions() {
+    let (dir, db) = test_db_path("ticket_bot_state_claim");
+    let repo = LegacySqliteTicketRepository::open_writable_for_tests(&db)
+        .await
+        .unwrap();
+    repo.create_schema_for_tests().await.unwrap();
+
+    assert!(repo
+        .try_claim_bot_state("ticket_application_decision:9001", "accepted")
+        .await
+        .unwrap());
+    assert!(!repo
+        .try_claim_bot_state("ticket_application_decision:9001", "accepted")
+        .await
+        .unwrap());
+
+    repo.delete_bot_state("ticket_application_decision:9001")
+        .await
+        .unwrap();
+    assert!(repo
+        .try_claim_bot_state("ticket_application_decision:9001", "accepted")
+        .await
+        .unwrap());
     cleanup_dir(dir);
 }
 

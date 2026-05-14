@@ -168,8 +168,20 @@ pub fn custom_ticket_description() -> &'static str {
     "Используйте этот канал для обсуждения темы тикета."
 }
 
-pub fn accept_application_channel_text() -> &'static str {
-    "### Вы приняты на испытательный срок, он продлится 2 недели.\n### По окончании испытательного срока <@&1498057076151422976> примет решение о окончательном принятии в клан."
+pub fn applicant_test_failed_channel_text() -> &'static str {
+    "### К сожалению вы не прошли тест, мы не можем принять вас.\n### Если не осталось вопросов закройте тикет.\n### С уважением XIII Legion."
+}
+
+pub fn applicant_test_passed_channel_text(interviewer_role_id: u64) -> String {
+    format!(
+        "### Поздравляю вы прошли тест.\n### Напиши тут время, когда удобно пройти краткое собеседование у <@&{interviewer_role_id}>."
+    )
+}
+
+pub fn accept_application_channel_text(interviewer_role_id: u64) -> String {
+    format!(
+        "### Вы приняты на испытательный срок, он продлится 2 недели.\n### По окончании испытательного срока <@&{interviewer_role_id}> примет решение о окончательном принятии в клан."
+    )
 }
 
 pub fn reject_application_channel_text() -> &'static str {

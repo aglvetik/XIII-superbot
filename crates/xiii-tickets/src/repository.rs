@@ -541,6 +541,27 @@ impl LegacySqliteTicketRepository {
         Ok(())
     }
 
+    pub async fn try_claim_bot_state(&self, key: &str, value: &str) -> Result<bool, String> {
+        self.ensure_writable()?;
+        let result = sqlx::query("INSERT OR IGNORE INTO bot_state(key, value) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| format!("failed to claim ticket bot_state {key}: {err}"))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_bot_state(&self, key: &str) -> Result<(), String> {
+        self.ensure_writable()?;
+        sqlx::query("DELETE FROM bot_state WHERE key=?")
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| format!("failed to delete ticket bot_state {key}: {err}"))?;
+        Ok(())
+    }
+
     async fn count_table(&self, table: &str) -> Result<i64, String> {
         let sql = format!("SELECT COUNT(*) AS count FROM {table}");
         let row = sqlx::query(&sql)

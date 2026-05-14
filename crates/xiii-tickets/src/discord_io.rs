@@ -258,6 +258,26 @@ impl TicketDiscordHttp {
             .map_err(|err| format!("failed to decode ticket embed message: {err}"))
     }
 
+    pub async fn update_message_components(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        components: &[Component],
+    ) -> Result<(), String> {
+        self.client
+            .update_message(
+                Id::<ChannelMarker>::new(channel_id),
+                Id::<MessageMarker>::new(message_id),
+            )
+            .allowed_mentions(Some(&AllowedMentions::default()))
+            .components(Some(components))
+            .await
+            .map(|_| ())
+            .map_err(|err| {
+                format!("failed to update ticket message components {message_id}: {err}")
+            })
+    }
+
     pub async fn send_officer_review(
         &self,
         payload: &OfficerReviewPayload,
@@ -800,6 +820,29 @@ pub fn officer_review_components(target_ticket_channel_id: u64) -> Vec<Component
             ButtonStyle::Danger,
         ),
     ])]
+}
+
+pub fn disabled_components(components: &[Component]) -> Vec<Component> {
+    components
+        .iter()
+        .map(|component| match component {
+            Component::ActionRow(row) => Component::ActionRow(ActionRow {
+                components: row
+                    .components
+                    .iter()
+                    .map(|nested| match nested {
+                        Component::Button(button) => {
+                            let mut button = button.clone();
+                            button.disabled = true;
+                            Component::Button(button)
+                        }
+                        other => other.clone(),
+                    })
+                    .collect(),
+            }),
+            other => other.clone(),
+        })
+        .collect()
 }
 
 pub fn allowed_mentions_are_limited(payload_roles: &[u64], configured_roles: &[u64]) -> bool {
