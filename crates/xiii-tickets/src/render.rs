@@ -55,6 +55,12 @@ pub const LEGACY_CLOSE_SUCCESS_COLOR: u32 = 0x2ECC71;
 pub const LEGACY_CLOSE_WARNING_COLOR: u32 = 0xE67E22;
 pub const LEGACY_CLOSE_FAILURE_COLOR: u32 = 0x607D8B;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedOfficerReviewScore {
+    pub value: f64,
+    pub display: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptMessage {
     pub author_id: u64,
@@ -254,22 +260,30 @@ pub fn officer_review_description(values: &[String], ticket_number: Option<i64>)
     }
 
     let score_raw = value(values, 2);
-    let score_value = score_raw.replace(',', ".");
-    let score = score_value.parse::<f64>().ok().unwrap_or(0.0);
-    let result_text = if score >= 7.0 {
+    let parsed_score = parse_officer_review_score(score_raw);
+    let result_text = if parsed_score
+        .as_ref()
+        .map(|score| score.value >= 7.0)
+        .unwrap_or(false)
+    {
         "✅ Тест пройден"
     } else {
         "❌ Тест не пройден"
     };
+    let score_display = parsed_score
+        .as_ref()
+        .map(|score| score.display.as_str())
+        .unwrap_or(score_raw);
+    let score_section = score_display.to_owned();
 
     format!(
-        "🧾 Заявка XIII Legion\n\n📊 Номер тикета\n{}\n\n👤 Имя Steam\n{}\n\n🎮 Steam ID\n{}\n\n📊 Баллы\n{} из 10\n\n🏠 Бывший клан\n{}\n\n⏱️ Время в Squad\n{}\n\n🤝 Готовы ли вы поддерживать дружеские отношения между соклановцами?\n{}\n\n🫃🏻 Сколько вам лет?\n{}\n\n💑 Как вы узнали о нашем клане?\n{}\n\n📌 Результат\n{}\n\nПеред принятием решения проведите собеседование с игроком.",
+        "🧾 Заявка XIII Legion\n\n📊 Номер тикета\n{}\n\n👤 Имя Steam\n{}\n\n🎮 Steam ID\n{}\n\n📊 Баллы\n{}\n\n🏠 Бывший клан\n{}\n\n⏱️ Время в Squad\n{}\n\n🤝 Готовы ли вы поддерживать дружеские отношения между соклановцами?\n{}\n\n🫃🏻 Сколько вам лет?\n{}\n\n💑 Как вы узнали о нашем клане?\n{}\n\n📌 Результат\n{}\n\nПеред принятием решения проведите собеседование с игроком.",
         ticket_number
             .map(|value| value.to_string())
             .unwrap_or_else(|| "—".to_owned()),
         value(values, 3),
         value(values, 4),
-        score_raw,
+        score_section,
         value(values, 16),
         value(values, 17),
         value(values, 18),
@@ -335,6 +349,22 @@ pub fn officer_review_text(draft: &OfficerReviewDraft) -> String {
         "Sheet row {} is ready for officer review. Signature {}. Target channel {}.",
         draft.sheet_row, draft.signature, draft.target_ticket_channel_id
     )
+}
+
+pub fn parse_officer_review_score(raw: &str) -> Option<ParsedOfficerReviewScore> {
+    let numbers = numeric_tokens(raw);
+    let first = numbers.first()?;
+    let value = first.parse::<f64>().ok()?;
+    let display = if raw.contains('/') && numbers.len() >= 2 {
+        format!(
+            "{} / {}",
+            format_score_number(value),
+            format_score_number(numbers[1].parse::<f64>().ok()?)
+        )
+    } else {
+        format_score_number(value)
+    };
+    Some(ParsedOfficerReviewScore { value, display })
 }
 
 pub fn transcript_model(ticket: &TicketRecord, messages: &[String]) -> String {
@@ -423,6 +453,62 @@ fn format_legacy_datetime(value: Option<&str>) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| UNKNOWN_VALUE.to_owned())
+}
+
+fn numeric_tokens(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut seen_separator = false;
+
+    for ch in raw.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+            continue;
+        }
+        if (ch == '.' || ch == ',') && !current.is_empty() && !seen_separator {
+            current.push('.');
+            seen_separator = true;
+            continue;
+        }
+        if !current.is_empty() {
+            if current.ends_with('.') {
+                current.pop();
+            }
+            if !current.is_empty() {
+                tokens.push(current.clone());
+            }
+            current.clear();
+            seen_separator = false;
+        }
+    }
+
+    if !current.is_empty() {
+        if current.ends_with('.') {
+            current.pop();
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+    }
+
+    tokens
+}
+
+fn format_score_number(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{}", value as i64)
+    } else {
+        let mut text = value.to_string();
+        if text.contains('.') {
+            while text.ends_with('0') {
+                text.pop();
+            }
+            if text.ends_with('.') {
+                text.pop();
+            }
+        }
+        text
+    }
 }
 
 pub fn sanitize_mentions(content: &str) -> String {

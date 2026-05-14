@@ -504,6 +504,20 @@ impl LegacySqliteTicketRepository {
             .map_err(|err| format!("failed to commit processed form transaction: {err}"))
     }
 
+    pub async fn mark_form_processed_after_send(
+        &self,
+        send_succeeded: bool,
+        sheet_row: i64,
+        signature: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, String> {
+        if !send_succeeded {
+            return Ok(false);
+        }
+        self.mark_form_processed(sheet_row, signature, now).await?;
+        Ok(true)
+    }
+
     pub async fn bot_state(&self, key: &str) -> Result<Option<String>, String> {
         let row = sqlx::query("SELECT value FROM bot_state WHERE key=?")
             .bind(key)

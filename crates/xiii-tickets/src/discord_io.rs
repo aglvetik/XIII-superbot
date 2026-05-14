@@ -69,6 +69,7 @@ pub struct TicketTranscriptPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfficerReviewPayload {
     pub officer_review_channel_id: u64,
+    pub target_ticket_channel_id: u64,
     pub title: Option<String>,
     pub description: String,
     pub color: u32,
@@ -268,10 +269,12 @@ impl TicketDiscordHttp {
             payload.color,
         )
         .ok_or_else(|| "ticket officer review embed could not be constructed".to_owned())?;
+        let components = officer_review_components(payload.target_ticket_channel_id);
         self.client
             .create_message(Id::<ChannelMarker>::new(payload.officer_review_channel_id))
             .allowed_mentions(Some(&allowed))
             .embeds(&[embed])
+            .components(&components)
             .await
             .map_err(|err| format!("failed to send ticket officer review: {err}"))?
             .model()
@@ -691,12 +694,13 @@ pub fn transcript_payload(
 
 pub fn officer_review_payload(
     officer_review_channel_id: u64,
-    _ticket_name: &str,
+    target_ticket_channel_id: u64,
     description: String,
     allowed_role_mentions: Vec<u64>,
 ) -> OfficerReviewPayload {
     OfficerReviewPayload {
         officer_review_channel_id,
+        target_ticket_channel_id,
         title: None,
         description,
         color: crate::render::LEGACY_OFFICER_REVIEW_COLOR,
@@ -773,6 +777,29 @@ pub fn dm_reopen_components() -> Vec<Component> {
         crate::render::TICKET_REOPEN_LABEL,
         ButtonStyle::Success,
     )])]
+}
+
+pub fn officer_review_components(target_ticket_channel_id: u64) -> Vec<Component> {
+    let accept_custom_id = crate::interactions::application_decision_custom_id(
+        crate::interactions::APP_DECISION_ACCEPT,
+        target_ticket_channel_id,
+    );
+    let reject_custom_id = crate::interactions::application_decision_custom_id(
+        crate::interactions::APP_DECISION_REJECT,
+        target_ticket_channel_id,
+    );
+    vec![action_row(vec![
+        button(
+            &accept_custom_id,
+            crate::render::APP_DECISION_ACCEPT_LABEL,
+            ButtonStyle::Success,
+        ),
+        button(
+            &reject_custom_id,
+            crate::render::APP_DECISION_REJECT_LABEL,
+            ButtonStyle::Danger,
+        ),
+    ])]
 }
 
 pub fn allowed_mentions_are_limited(payload_roles: &[u64], configured_roles: &[u64]) -> bool {

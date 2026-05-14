@@ -11419,7 +11419,8 @@ async fn ticket_google_forms_poll_tick(runtime: &MixedSuperbotRuntime) -> Result
         .ok_or_else(|| "ticket Discord adapter is unavailable".to_owned())?;
     let config = ticket_google_poll_config(&runtime.env_file)?;
     let google = xiii_tickets::google::GoogleSheetsReadonlyClient::new();
-    let rows = google.fetch_rows(&config).await?;
+    let mut rows = google.fetch_rows(&config).await?;
+    rows.sort_by_key(|row| row.sheet_row);
     for row in rows {
         if row.values.iter().all(|value| value.trim().is_empty()) {
             continue;
@@ -11431,8 +11432,6 @@ async fn ticket_google_forms_poll_tick(runtime: &MixedSuperbotRuntime) -> Result
             continue;
         }
         let Some(ticket_number) = xiii_tickets::runtime::ticket_number_from_google_row(&row) else {
-            repo.mark_form_processed(row.sheet_row, &signature, chrono::Utc::now())
-                .await?;
             continue;
         };
         let Some(ticket) = repo
@@ -11444,22 +11443,20 @@ async fn ticket_google_forms_poll_tick(runtime: &MixedSuperbotRuntime) -> Result
         let Some(channel_id) = ticket.channel_id else {
             continue;
         };
-        let description = format!(
-            "{}\n\nTarget channel {}.",
-            xiii_tickets::runtime::officer_review_description(&row, Some(ticket_number)),
-            channel_id
-        );
+        let description =
+            xiii_tickets::runtime::officer_review_description(&row, Some(ticket_number));
         let payload = xiii_tickets::discord_io::officer_review_payload(
             runtime.config.tickets.officer_review_channel_id,
-            ticket
-                .ticket_name
-                .as_deref()
-                .unwrap_or("application-ticket"),
+            channel_id,
             description,
-            vec![runtime.config.tickets.application_ping_role_id],
+            if runtime.config.tickets.application_ping_role_id == 0 {
+                Vec::new()
+            } else {
+                vec![runtime.config.tickets.application_ping_role_id]
+            },
         );
         discord.send_officer_review(&payload).await?;
-        repo.mark_form_processed(row.sheet_row, &signature, chrono::Utc::now())
+        repo.mark_form_processed_after_send(true, row.sheet_row, &signature, chrono::Utc::now())
             .await?;
     }
     Ok(())
@@ -11567,6 +11564,13 @@ fn message_author_can_accept(message: &DiscordMessage, runtime: &MixedSuperbotRu
 }
 
 fn parse_ticket_target_channel_from_interaction(interaction: &Interaction) -> Option<u64> {
+    if let Some(custom_id) = interaction_component_custom_id(interaction) {
+        if let Some(channel_id) =
+            xiii_tickets::interactions::parse_application_decision_target_channel(custom_id)
+        {
+            return Some(channel_id);
+        }
+    }
     let message = interaction.message.as_ref()?;
     for embed in &message.embeds {
         if let Some(description) = embed.description.as_deref() {
@@ -11588,6 +11592,15 @@ fn parse_target_channel_from_text(text: &str) -> Option<u64> {
         .collect::<String>()
         .parse::<u64>()
         .ok()
+}
+
+fn interaction_component_custom_id(interaction: &Interaction) -> Option<&str> {
+    match interaction.data.as_ref()? {
+        twilight_model::application::interaction::InteractionData::MessageComponent(data) => {
+            Some(data.custom_id.as_str())
+        }
+        _ => None,
+    }
 }
 
 async fn ticket_cutover_check(env_file: PathBuf) -> ExitCode {

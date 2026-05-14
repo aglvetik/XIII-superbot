@@ -30,7 +30,7 @@ pub enum TicketComponentRoute {
 }
 
 pub fn route_ticket_panel(custom_id: &str) -> Option<&'static str> {
-    match custom_id {
+    match component_route_base(custom_id) {
         PANEL_APPLY => Some("application"),
         PANEL_QUESTION => Some("complaint"),
         PANEL_IDEA => Some("idea"),
@@ -39,7 +39,7 @@ pub fn route_ticket_panel(custom_id: &str) -> Option<&'static str> {
 }
 
 pub fn route_ticket_component(custom_id: &str) -> Option<TicketComponentRoute> {
-    match custom_id {
+    match component_route_base(custom_id) {
         PANEL_APPLY => Some(TicketComponentRoute::OpenApplication),
         PANEL_QUESTION => Some(TicketComponentRoute::OpenQuestion),
         PANEL_IDEA => Some(TicketComponentRoute::OpenIdea),
@@ -55,4 +55,22 @@ pub fn route_ticket_component(custom_id: &str) -> Option<TicketComponentRoute> {
         APP_DECISION_REJECT => Some(TicketComponentRoute::ApplicationReject),
         _ => None,
     }
+}
+
+pub fn application_decision_custom_id(base: &str, target_ticket_channel_id: u64) -> String {
+    format!("{base}:{target_ticket_channel_id}")
+}
+
+pub fn parse_application_decision_target_channel(custom_id: &str) -> Option<u64> {
+    let (base, value) = custom_id.split_once(':')?;
+    matches!(base, APP_DECISION_ACCEPT | APP_DECISION_REJECT)
+        .then_some(value)
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn component_route_base(custom_id: &str) -> &str {
+    custom_id
+        .split_once(':')
+        .map(|(base, _)| base)
+        .unwrap_or(custom_id)
 }

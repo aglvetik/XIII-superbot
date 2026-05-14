@@ -5,24 +5,28 @@ use crate::commands::{
 use crate::discord_io::{
     after_close_components, allowed_mentions_are_limited, close_confirmation_components,
     close_confirmation_payload, closed_ticket_owner_overwrite, dm_reopen_components,
-    embed_from_draft, officer_review_payload, permission_overwrites_for_ticket,
-    reopen_ticket_owner_overwrite, ticket_open_payload, ticket_panel_button_specs,
-    transcript_payload, TicketChannelCreateRequest,
+    embed_from_draft, officer_review_components, officer_review_payload,
+    permission_overwrites_for_ticket, reopen_ticket_owner_overwrite, ticket_open_payload,
+    ticket_panel_button_specs, transcript_payload, TicketChannelCreateRequest,
 };
 use crate::google::{
     google_sheet_range, google_sheets_read_plan, values_to_rows, GoogleSheetsPollConfig,
 };
-use crate::interactions::{route_ticket_component, route_ticket_panel, TicketComponentRoute};
+use crate::interactions::{
+    application_decision_custom_id, parse_application_decision_target_channel,
+    route_ticket_component, route_ticket_panel, TicketComponentRoute,
+};
 use crate::render::{
     close_cancelled_embed, close_confirmation_embed, close_result_embed, member_history,
-    panel_description, panel_title, transcript_html, transcript_model, transcript_summary_embed,
-    transcript_text, TranscriptMessage, CLOSE_CONFIRM_DESCRIPTION, CLOSE_CONFIRM_TITLE,
-    CLOSE_RESULT_FAILED_TITLE, CLOSE_RESULT_SAVED_TITLE, CLOSE_RESULT_SENT_TITLE,
-    LEGACY_CLOSE_FAILURE_COLOR, LEGACY_CLOSE_SUCCESS_COLOR, LEGACY_CLOSE_WARNING_COLOR,
-    LEGACY_COMPLAINT_COLOR, LEGACY_OFFICER_REVIEW_COLOR, LEGACY_PANEL_COLOR, TICKET_CREATED_TITLE,
-    TRANSCRIPT_FIELD_CLOSED_AT, TRANSCRIPT_FIELD_CLOSED_BY, TRANSCRIPT_FIELD_NUMBER,
-    TRANSCRIPT_FIELD_OPENED_AT, TRANSCRIPT_FIELD_OPENED_BY, TRANSCRIPT_FIELD_PARTICIPANTS,
-    TRANSCRIPT_FIELD_TICKET, TRANSCRIPT_FIELD_TYPE,
+    panel_description, panel_title, parse_officer_review_score, transcript_html, transcript_model,
+    transcript_summary_embed, transcript_text, TranscriptMessage, CLOSE_CONFIRM_DESCRIPTION,
+    CLOSE_CONFIRM_TITLE, CLOSE_RESULT_FAILED_TITLE, CLOSE_RESULT_SAVED_TITLE,
+    CLOSE_RESULT_SENT_TITLE, LEGACY_CLOSE_FAILURE_COLOR, LEGACY_CLOSE_SUCCESS_COLOR,
+    LEGACY_CLOSE_WARNING_COLOR, LEGACY_COMPLAINT_COLOR, LEGACY_OFFICER_REVIEW_COLOR,
+    LEGACY_PANEL_COLOR, TICKET_CREATED_TITLE, TRANSCRIPT_FIELD_CLOSED_AT,
+    TRANSCRIPT_FIELD_CLOSED_BY, TRANSCRIPT_FIELD_NUMBER, TRANSCRIPT_FIELD_OPENED_AT,
+    TRANSCRIPT_FIELD_OPENED_BY, TRANSCRIPT_FIELD_PARTICIPANTS, TRANSCRIPT_FIELD_TICKET,
+    TRANSCRIPT_FIELD_TYPE,
 };
 use crate::repository::{google_form_signature, LegacySqliteTicketRepository};
 use crate::runtime::{
@@ -73,6 +77,14 @@ fn custom_id_routing_preserves_panel_buttons_and_lifecycle_buttons() {
     assert_eq!(
         route_ticket_component("app_decision_reject"),
         Some(TicketComponentRoute::ApplicationReject)
+    );
+    assert_eq!(
+        route_ticket_component("app_decision_accept:9001"),
+        Some(TicketComponentRoute::ApplicationAccept)
+    );
+    assert_eq!(
+        parse_application_decision_target_channel("app_decision_reject:9001"),
+        Some(9001)
     );
 }
 
@@ -307,6 +319,58 @@ fn google_dedupe_signature_and_review_decision_are_stable() {
 }
 
 #[test]
+fn google_score_parser_accepts_legacy_google_formats() {
+    let parsed = parse_officer_review_score("7 / 10").unwrap();
+    assert_eq!(parsed.value, 7.0);
+    assert_eq!(parsed.display, "7 / 10");
+    assert!(crate::render::officer_review_description(
+        &vec![
+            "".into(),
+            "".into(),
+            "7 / 10".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+        ],
+        Some(15)
+    )
+    .contains("✅ Тест пройден"));
+
+    let parsed = parse_officer_review_score("6 / 10").unwrap();
+    assert_eq!(parsed.value, 6.0);
+    assert_eq!(parsed.display, "6 / 10");
+
+    let parsed = parse_officer_review_score("7,0 / 10").unwrap();
+    assert_eq!(parsed.value, 7.0);
+    assert_eq!(parsed.display, "7 / 10");
+
+    let parsed = parse_officer_review_score("7/10").unwrap();
+    assert_eq!(parsed.value, 7.0);
+    assert_eq!(parsed.display, "7 / 10");
+
+    let parsed = parse_officer_review_score("7.0").unwrap();
+    assert_eq!(parsed.value, 7.0);
+    assert_eq!(parsed.display, "7");
+}
+
+#[test]
 fn google_read_plan_redacts_credentials_and_builds_range() {
     let config = GoogleSheetsPollConfig {
         credentials_file: PathBuf::from("credentials.json"),
@@ -344,14 +408,74 @@ fn google_values_convert_to_stable_rows_without_network() {
 #[test]
 fn transcript_and_officer_payloads_do_not_leak_secret_markers() {
     let transcript = transcript_payload(500, "application-24", "hello".to_owned());
-    let officer = officer_review_payload(600, "application-24", "review".to_owned(), vec![700]);
+    let officer = officer_review_payload(600, 9001, "review".to_owned(), vec![700]);
 
     assert_eq!(transcript.filename, "transcript-application-24.html");
     assert_eq!(officer.allowed_role_mentions, vec![700]);
     assert_eq!(officer.title, None);
     assert_eq!(officer.color, LEGACY_OFFICER_REVIEW_COLOR);
+    assert_eq!(officer.target_ticket_channel_id, 9001);
     assert!(!transcript.body.contains("DISCORD_TOKEN"));
     assert!(!officer.description.contains("PRIVATE_KEY"));
+}
+
+#[test]
+fn officer_review_payload_includes_buttons_and_no_debug_leak() {
+    let payload = officer_review_payload(
+        600,
+        9001,
+        crate::render::officer_review_description(
+            &vec![
+                "".into(),
+                "".into(),
+                "7 / 10".into(),
+                "Steam User".into(),
+                "7656119".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "Old Clan".into(),
+                "200".into(),
+                "Да".into(),
+                "".into(),
+                "".into(),
+                "25".into(),
+                "Discord".into(),
+            ],
+            Some(15),
+        ),
+        vec![700],
+    );
+    let buttons =
+        component_button_specs(&officer_review_components(payload.target_ticket_channel_id));
+
+    assert_eq!(buttons.len(), 2);
+    assert_eq!(
+        buttons[0],
+        (
+            application_decision_custom_id("app_decision_accept", 9001),
+            "✅ Принять".to_owned()
+        )
+    );
+    assert_eq!(
+        buttons[1],
+        (
+            application_decision_custom_id("app_decision_reject", 9001),
+            "❌ Отклонить".to_owned()
+        )
+    );
+    assert!(!payload.description.contains("Target channel"));
+    assert!(payload.description.contains("✅ Тест пройден"));
+    assert!(payload.description.contains("7 / 10"));
+    assert!(!payload.description.contains("7 / 10 из 10"));
 }
 
 #[test]
@@ -544,6 +668,31 @@ async fn sqlite_google_form_dedupe_is_persistent() {
         .form_signature_processed_async(&signature)
         .await
         .unwrap());
+    cleanup_dir(dir);
+}
+
+#[tokio::test]
+async fn processed_marker_is_written_only_after_successful_send() {
+    let (dir, db) = test_db_path("google_processed_after_send");
+    let repo = LegacySqliteTicketRepository::open_writable_for_tests(&db)
+        .await
+        .unwrap();
+    repo.create_schema_for_tests().await.unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 5, 10, 12, 0, 0).unwrap();
+
+    assert!(!repo
+        .mark_form_processed_after_send(false, 15, "sig-15", now)
+        .await
+        .unwrap());
+    assert!(!repo.processed_form_row_exists(15).await.unwrap());
+    assert!(!repo.form_signature_processed_async("sig-15").await.unwrap());
+
+    assert!(repo
+        .mark_form_processed_after_send(true, 15, "sig-15", now)
+        .await
+        .unwrap());
+    assert!(repo.processed_form_row_exists(15).await.unwrap());
+    assert!(repo.form_signature_processed_async("sig-15").await.unwrap());
     cleanup_dir(dir);
 }
 
