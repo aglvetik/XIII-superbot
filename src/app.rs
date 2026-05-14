@@ -12336,9 +12336,9 @@ fn production_path_issue(path: &Path) -> Option<&'static str> {
     let normalized = normalized_path_string(path);
     if normalized.contains("xiii_bots_full_copy") {
         Some("points at XIII_BOTS_FULL_COPY; replace it with the real VPS legacy path before production")
-    } else if normalized.contains(":\\") {
+    } else if normalized.contains(":/") {
         Some("looks like a Windows path; production env files must use Linux VPS paths")
-    } else if !normalized.starts_with('\\') {
+    } else if !normalized.starts_with('/') {
         Some("is relative; production env files should use explicit VPS paths")
     } else {
         None
@@ -14127,7 +14127,7 @@ fn path_is_equal_or_inside(path: &Path, ancestor: &Path) -> bool {
         || normalized_path_string(path).starts_with(&format!(
             "{}{}",
             normalized_path_string(ancestor),
-            std::path::MAIN_SEPARATOR
+            "/"
         ))
 }
 
@@ -14136,7 +14136,7 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
 }
 
 fn normalized_path_string(path: &Path) -> String {
-    let text = path.to_string_lossy().replace('/', "\\");
+    let text = path.to_string_lossy().replace('\\', "/");
     if cfg!(windows) {
         text.to_ascii_lowercase()
     } else {
