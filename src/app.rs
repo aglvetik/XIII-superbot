@@ -12682,14 +12682,22 @@ fn add_production_path_report(report: &mut Report, scope: &str, label: &str, pat
     }
 }
 
-fn production_path_issue(path: &Path) -> Option<&'static str> {
+fn production_path_issue(path: &Path) -> Option<String> {
     let normalized = normalized_path_string(path);
-    if normalized.contains("xiii_bots_full_copy") {
-        Some("points at XIII_BOTS_FULL_COPY; replace it with the real VPS legacy path before production")
+    let normalized_lower = normalized.to_ascii_lowercase();
+    let original = path.display().to_string();
+    if normalized_lower.contains("xiii_bots_full_copy") {
+        Some(format!(
+            "points at XIII_BOTS_FULL_COPY ({original}); replace it with the real VPS legacy path before production"
+        ))
     } else if normalized.contains(":/") {
-        Some("looks like a Windows path; production env files must use Linux VPS paths")
+        Some(format!(
+            "looks like a Windows path ({original}); production env files must use Linux VPS paths"
+        ))
     } else if !normalized.starts_with('/') {
-        Some("is relative; production env files should use explicit VPS paths")
+        Some(format!(
+            "is relative ({original}); production env files should use explicit VPS paths"
+        ))
     } else {
         None
     }
