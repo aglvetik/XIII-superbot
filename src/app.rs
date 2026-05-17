@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Row;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -4819,6 +4819,17 @@ struct DisciplinePickerMember {
     username: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisciplineLookupMember {
+    user_id: u64,
+    display_name: String,
+    username: String,
+    global_name: Option<String>,
+    nickname: Option<String>,
+    role_ids: Vec<u64>,
+    is_bot: bool,
+}
+
 #[derive(Debug, Clone)]
 struct DisciplineIssuePickerSession {
     id: String,
@@ -4846,37 +4857,25 @@ fn unix_millis_now() -> u128 {
 
 async fn discipline_issue_picker_members(
     runtime: &MixedSuperbotRuntime,
-) -> Vec<DisciplinePickerMember> {
-    let cache = runtime.voice_activity_members.lock().await;
-    let mut members = cache
-        .values()
-        .filter(|member| {
-            !member.is_bot
-                && member
-                    .role_ids
-                    .contains(&runtime.config.discipline.main_clan_role_id)
-        })
-        .map(|member| DisciplinePickerMember {
-            user_id: member.user_id,
-            display_name: member.display_name.clone(),
-            username: member.username.clone().unwrap_or_default(),
-        })
+) -> Result<Vec<DisciplinePickerMember>, String> {
+    let members =
+        discipline_fetch_live_guild_members(runtime, runtime.config.core.guild_id).await?;
+    let lookup_members = members
+        .iter()
+        .map(discipline_lookup_member_from_guild_member)
         .collect::<Vec<_>>();
-    members.sort_by(|left, right| {
-        left.display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase())
-            .then_with(|| left.user_id.cmp(&right.user_id))
-    });
-    members
+    Ok(discipline_picker_members_from_lookup_members(
+        &lookup_members,
+        runtime.config.discipline.main_clan_role_id,
+    ))
 }
 
 async fn discipline_create_issue_picker_session(
     runtime: &MixedSuperbotRuntime,
     issuer_id: u64,
-) -> DisciplineIssuePickerSession {
+) -> Result<DisciplineIssuePickerSession, String> {
     let now = unix_millis_now();
-    let members = discipline_issue_picker_members(runtime).await;
+    let members = discipline_issue_picker_members(runtime).await?;
     let session = DisciplineIssuePickerSession {
         id: format!(
             "{:x}{:x}",
@@ -4892,7 +4891,255 @@ async fn discipline_create_issue_picker_session(
     let mut guard = store.lock().await;
     guard.retain(|_, current| current.expires_at_unix_ms > now);
     guard.insert(session.id.clone(), session.clone());
-    session
+    Ok(session)
+}
+
+fn discipline_lookup_member_from_guild_member(member: &DiscordMember) -> DisciplineLookupMember {
+    DisciplineLookupMember {
+        user_id: member.user.id.get(),
+        display_name: display_name_from_member(member),
+        username: member.user.name.clone(),
+        global_name: member.user.global_name.clone(),
+        nickname: member.nick.clone(),
+        role_ids: member.roles.iter().map(|role_id| role_id.get()).collect(),
+        is_bot: member.user.bot,
+    }
+}
+
+fn discipline_picker_members_from_lookup_members(
+    members: &[DisciplineLookupMember],
+    main_role_id: u64,
+) -> Vec<DisciplinePickerMember> {
+    let mut picker_members = members
+        .iter()
+        .filter(|member| !member.is_bot && member.role_ids.contains(&main_role_id))
+        .map(|member| DisciplinePickerMember {
+            user_id: member.user_id,
+            display_name: member.display_name.clone(),
+            username: member.username.clone(),
+        })
+        .collect::<Vec<_>>();
+    picker_members.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+            .then_with(|| left.user_id.cmp(&right.user_id))
+    });
+    picker_members
+}
+
+async fn discipline_fetch_live_guild_members(
+    runtime: &MixedSuperbotRuntime,
+    guild_id: u64,
+) -> Result<Vec<DiscordMember>, String> {
+    let guild_id = Id::<GuildMarker>::new(guild_id);
+    let mut after: Option<Id<UserMarker>> = None;
+    let mut members = Vec::new();
+    let mut report = Report::new();
+
+    loop {
+        let page = fetch_guild_members_page_with_retry(
+            runtime.http.as_ref(),
+            guild_id,
+            after,
+            &mut report,
+        )
+        .await
+        .map_err(|err| format!("Не удалось обновить список участников через Discord: {err}"))?;
+        if page.is_empty() {
+            break;
+        }
+
+        let page_len = page.len();
+        after = page.last().map(|member| member.user.id);
+        members.extend(page);
+
+        if page_len < 1000 {
+            break;
+        }
+    }
+
+    seed_voice_activity_members(runtime, &members).await;
+    Ok(members)
+}
+
+fn discipline_normalize_lookup_value(value: &str) -> String {
+    value
+        .trim()
+        .strip_prefix('@')
+        .unwrap_or_else(|| value.trim())
+        .to_lowercase()
+}
+
+fn discipline_parse_target_user_id(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("<@")
+        .and_then(|value| value.strip_suffix('>'))
+    {
+        return rest
+            .strip_prefix('!')
+            .unwrap_or(rest)
+            .trim()
+            .parse::<u64>()
+            .ok();
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+fn discipline_lookup_member_names(member: &DisciplineLookupMember) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut values = Vec::new();
+    for value in [
+        Some(member.display_name.as_str()),
+        member.nickname.as_deref(),
+        Some(member.username.as_str()),
+        member.global_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = discipline_normalize_lookup_value(trimmed);
+        if seen.insert(normalized) {
+            values.push(trimmed.to_owned());
+        }
+    }
+    values
+}
+
+fn discipline_match_lookup_members<'a, F>(
+    members: &'a [DisciplineLookupMember],
+    query: &str,
+    predicate: F,
+) -> Vec<&'a DisciplineLookupMember>
+where
+    F: Fn(&str, &str) -> bool,
+{
+    let mut seen = HashSet::new();
+    let mut matches = members
+        .iter()
+        .filter(|member| !member.is_bot)
+        .filter(|member| {
+            discipline_lookup_member_names(member)
+                .iter()
+                .map(|value| discipline_normalize_lookup_value(value))
+                .any(|candidate| predicate(&candidate, query))
+        })
+        .filter(|member| seen.insert(member.user_id))
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+            .then_with(|| left.user_id.cmp(&right.user_id))
+    });
+    matches
+}
+
+fn discipline_lookup_candidate_summary(member: &DisciplineLookupMember) -> String {
+    if member.username.trim().is_empty() || member.username == member.display_name {
+        format!("{} ({})", member.display_name, member.user_id)
+    } else {
+        format!(
+            "{} (@{}, {})",
+            member.display_name, member.username, member.user_id
+        )
+    }
+}
+
+fn discipline_ambiguous_lookup_error(query: &str, matches: &[&DisciplineLookupMember]) -> String {
+    let preview = matches
+        .iter()
+        .take(5)
+        .map(|member| format!("• {}", discipline_lookup_candidate_summary(member)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let overflow = matches.len().saturating_sub(5);
+    if overflow > 0 {
+        format!(
+            "Найдено несколько участников для \"{query}\":\n{preview}\n… и ещё {overflow}. Укажи ID или упоминание."
+        )
+    } else {
+        format!(
+            "Найдено несколько участников для \"{query}\":\n{preview}\nУкажи ID или упоминание."
+        )
+    }
+}
+
+fn discipline_resolve_lookup_member_id(
+    query: &str,
+    members: &[DisciplineLookupMember],
+) -> Result<u64, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(xiii_discipline::render::INVALID_MEMBER_ID.to_owned());
+    }
+
+    if let Some(user_id) = discipline_parse_target_user_id(trimmed) {
+        return members
+            .iter()
+            .find(|member| member.user_id == user_id && !member.is_bot)
+            .map(|member| member.user_id)
+            .ok_or_else(|| format!("Участник с ID {user_id} не найден на сервере."));
+    }
+
+    let normalized = discipline_normalize_lookup_value(trimmed);
+    for predicate in [
+        |candidate: &str, query: &str| candidate == query,
+        |candidate: &str, query: &str| candidate.starts_with(query),
+        |candidate: &str, query: &str| candidate.contains(query),
+    ] {
+        let matches = discipline_match_lookup_members(members, &normalized, predicate);
+        if matches.len() == 1 {
+            return Ok(matches[0].user_id);
+        }
+        if matches.len() > 1 {
+            return Err(discipline_ambiguous_lookup_error(trimmed, &matches));
+        }
+    }
+
+    Err(format!(
+        "Не удалось найти участника по запросу \"{trimmed}\". Укажи ID, упоминание или более точное имя."
+    ))
+}
+
+async fn discipline_resolve_manual_target(
+    runtime: &MixedSuperbotRuntime,
+    guild_id: u64,
+    query: &str,
+) -> Result<DiscordMember, String> {
+    if let Some(user_id) = discipline_parse_target_user_id(query) {
+        return fetch_member_checked(runtime, guild_id, user_id)
+            .await
+            .map_err(|err| {
+                if err.contains("404")
+                    || err.contains("Unknown Member")
+                    || err.contains("unknown member")
+                {
+                    format!("Участник с ID {user_id} не найден на сервере.")
+                } else {
+                    format!("Не удалось получить участника с ID {user_id} через Discord.")
+                }
+            });
+    }
+
+    let members = discipline_fetch_live_guild_members(runtime, guild_id).await?;
+    let lookup_members = members
+        .iter()
+        .map(discipline_lookup_member_from_guild_member)
+        .collect::<Vec<_>>();
+    let user_id = discipline_resolve_lookup_member_id(query, &lookup_members)?;
+    members
+        .into_iter()
+        .find(|member| member.user.id.get() == user_id)
+        .ok_or_else(|| format!("Участник с ID {user_id} не найден на сервере."))
 }
 
 async fn discipline_get_issue_picker_session(
@@ -5051,15 +5298,22 @@ async fn handle_discipline_component(
         .unwrap_or_default();
     match custom_id {
         xiii_discipline::interactions::PANEL_ISSUE => {
-            let session = discipline_create_issue_picker_session(runtime, actor_id).await;
-            let (content, components) = discipline_issue_picker_message(&session);
-            respond_interaction_ephemeral_components_http(
-                runtime.http.as_ref(),
-                interaction,
-                &content,
-                components,
-            )
-            .await;
+            match discipline_create_issue_picker_session(runtime, actor_id).await {
+                Ok(session) => {
+                    let (content, components) = discipline_issue_picker_message(&session);
+                    respond_interaction_ephemeral_components_http(
+                        runtime.http.as_ref(),
+                        interaction,
+                        &content,
+                        components,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    respond_interaction_ephemeral_http(runtime.http.as_ref(), interaction, &err)
+                        .await;
+                }
+            }
         }
         xiii_discipline::interactions::PANEL_REMOVE => {
             respond_interaction_ephemeral_components_http(
@@ -5615,9 +5869,7 @@ async fn handle_discipline_modal(
             .await;
             return;
         }
-        let Some(target_user_id) =
-            modal_value(data, "target_user_id").and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(target_query) = modal_value(data, "target_user_id") else {
             respond_interaction_ephemeral_http(
                 runtime.http.as_ref(),
                 interaction,
@@ -5626,7 +5878,9 @@ async fn handle_discipline_modal(
             .await;
             return;
         };
-        match fetch_member_checked(runtime, runtime.config.core.guild_id, target_user_id).await {
+        match discipline_resolve_manual_target(runtime, runtime.config.core.guild_id, &target_query)
+            .await
+        {
             Ok(target) => {
                 if let Err(err) = discipline_validate_target(
                     runtime,
@@ -5638,6 +5892,7 @@ async fn handle_discipline_modal(
                         .await;
                     return;
                 }
+                let target_user_id = target.user.id.get();
                 let content = xiii_discipline::render::issue_type_content(target_user_id);
                 respond_interaction_ephemeral_components_http(
                     runtime.http.as_ref(),
@@ -5720,8 +5975,27 @@ async fn handle_discipline_modal(
         {
             id
         } else {
-            match modal_value(data, "target_user_id").and_then(|value| value.parse::<u64>().ok()) {
-                Some(id) => id,
+            match modal_value(data, "target_user_id") {
+                Some(query) => {
+                    match discipline_resolve_manual_target(
+                        runtime,
+                        runtime.config.core.guild_id,
+                        &query,
+                    )
+                    .await
+                    {
+                        Ok(member) => member.user.id.get(),
+                        Err(err) => {
+                            respond_interaction_ephemeral_http(
+                                runtime.http.as_ref(),
+                                interaction,
+                                &err,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
                 None => {
                     respond_interaction_ephemeral_http(
                         runtime.http.as_ref(),
@@ -6266,15 +6540,12 @@ fn discipline_validate_target(
         .try_lock()
         .ok()
         .and_then(|occupancy| occupancy.guild_owner_id(guild_id));
-    let has_main = target
-        .roles
-        .iter()
-        .any(|role| role.get() == runtime.config.discipline.main_clan_role_id);
-    xiii_discipline::commands::valid_target(
-        target.user.bot,
-        owner_id == Some(target_user_id),
-        has_main,
-    )?;
+    if target.user.bot {
+        return Err("target must not be a bot".to_owned());
+    }
+    if owner_id == Some(target_user_id) {
+        return Err("target must not be the server owner".to_owned());
+    }
     let target_is_officer = target.roles.iter().any(|role| {
         runtime
             .config
@@ -15259,18 +15530,19 @@ mod tests {
     use super::{
         bootstrap_permission_failure, build_module_status_report, clanlist_health_from_outcome,
         clanlist_interval_seconds, collect_json_message_targets,
-        deferred_ephemeral_interaction_response, discord_read_permission_failure,
-        duration_between_iso_clamped, emit_output, legacy_parity_modules, module_manifests,
-        module_render_preview, parse_old_service_status, parse_retry_after_from_body,
-        production_path_issue, render_preview_json, resolve_health_output_path,
-        resolve_state_file_path, resolve_state_output_path, retry_delay_for_attempt,
-        run_clanlist_permission_failure, run_superbot_permission_failure, sync_command_plan,
-        ticket_component_requires_deferred_ack, ticket_transcript_message_action,
-        update_permission_failure, valid_voice_cutover_state, validate_fresh_state_json,
-        validate_output_path, write_clanlist_health, write_plan_permission_failure,
-        ClanlistRefreshOutcome, LegacyParityStatus, ModuleReadiness, NonOverlapGuard,
-        OldServiceStatus, SuperbotModuleKind, SyncPlanStatus, TempVoiceOccupancy,
-        TicketTranscriptMessageAction,
+        deferred_ephemeral_interaction_response, discipline_parse_target_user_id,
+        discipline_picker_members_from_lookup_members, discipline_resolve_lookup_member_id,
+        discord_read_permission_failure, duration_between_iso_clamped, emit_output,
+        legacy_parity_modules, module_manifests, module_render_preview, parse_old_service_status,
+        parse_retry_after_from_body, production_path_issue, render_preview_json,
+        resolve_health_output_path, resolve_state_file_path, resolve_state_output_path,
+        retry_delay_for_attempt, run_clanlist_permission_failure, run_superbot_permission_failure,
+        sync_command_plan, ticket_component_requires_deferred_ack,
+        ticket_transcript_message_action, update_permission_failure, valid_voice_cutover_state,
+        validate_fresh_state_json, validate_output_path, write_clanlist_health,
+        write_plan_permission_failure, ClanlistRefreshOutcome, DisciplineLookupMember,
+        LegacyParityStatus, ModuleReadiness, NonOverlapGuard, OldServiceStatus, SuperbotModuleKind,
+        SyncPlanStatus, TempVoiceOccupancy, TicketTranscriptMessageAction,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -15669,6 +15941,122 @@ mod tests {
         assert!(sync_command_plan(&[SuperbotModuleKind::Discipline])[0]
             .commands
             .contains(&"/discipline"));
+    }
+
+    fn discipline_lookup_member_fixture(
+        user_id: u64,
+        display_name: &str,
+        username: &str,
+        global_name: Option<&str>,
+        nickname: Option<&str>,
+        role_ids: &[u64],
+    ) -> DisciplineLookupMember {
+        DisciplineLookupMember {
+            user_id,
+            display_name: display_name.to_owned(),
+            username: username.to_owned(),
+            global_name: global_name.map(str::to_owned),
+            nickname: nickname.map(str::to_owned),
+            role_ids: role_ids.to_vec(),
+            is_bot: false,
+        }
+    }
+
+    #[test]
+    fn discipline_picker_members_include_members_with_main_role_from_live_roster() {
+        let main_role_id = 1_498_022_112_114_249_827u64;
+        let members = vec![
+            discipline_lookup_member_fixture(
+                200,
+                "Officer Two",
+                "officer_two",
+                None,
+                None,
+                &[main_role_id],
+            ),
+            discipline_lookup_member_fixture(
+                100,
+                "Officer One",
+                "officer_one",
+                None,
+                None,
+                &[main_role_id, 99],
+            ),
+            discipline_lookup_member_fixture(300, "Guest", "guest_user", None, None, &[99]),
+        ];
+
+        let picker = discipline_picker_members_from_lookup_members(&members, main_role_id);
+
+        assert_eq!(picker.len(), 2);
+        assert_eq!(picker[0].user_id, 100);
+        assert_eq!(picker[1].user_id, 200);
+    }
+
+    #[test]
+    fn discipline_manual_lookup_by_raw_id_works_without_main_role() {
+        let members = vec![discipline_lookup_member_fixture(
+            4242,
+            "External Candidate",
+            "candidate4242",
+            None,
+            None,
+            &[],
+        )];
+
+        assert_eq!(
+            discipline_resolve_lookup_member_id("4242", &members).unwrap(),
+            4242
+        );
+    }
+
+    #[test]
+    fn discipline_manual_lookup_by_mention_supports_both_formats() {
+        let members = vec![discipline_lookup_member_fixture(
+            5151,
+            "Mention Target",
+            "mention_target",
+            None,
+            None,
+            &[],
+        )];
+
+        assert_eq!(
+            discipline_resolve_lookup_member_id("<@5151>", &members).unwrap(),
+            5151
+        );
+        assert_eq!(
+            discipline_resolve_lookup_member_id("<@!5151>", &members).unwrap(),
+            5151
+        );
+        assert_eq!(discipline_parse_target_user_id("<@!5151>"), Some(5151));
+    }
+
+    #[test]
+    fn discipline_manual_lookup_by_name_returns_ambiguous_error() {
+        let members = vec![
+            discipline_lookup_member_fixture(
+                7001,
+                "Fox",
+                "fox_alpha",
+                Some("Fox"),
+                Some("Лиса"),
+                &[1],
+            ),
+            discipline_lookup_member_fixture(
+                7002,
+                "Fox",
+                "fox_beta",
+                Some("Fox"),
+                Some("Лиса"),
+                &[1],
+            ),
+        ];
+
+        let err = discipline_resolve_lookup_member_id("fox", &members).unwrap_err();
+
+        assert!(err.contains("несколько"));
+        assert!(err.contains("7001"));
+        assert!(err.contains("7002"));
     }
 
     #[test]
